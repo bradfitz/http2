@@ -24,11 +24,14 @@ const (
 	FrameGoAway       FrameType = 0x7
 	FrameWindowUpdate FrameType = 0x8
 	FrameContinuation FrameType = 0x9
-
-	FlagSettingsAck Flags = 0x1
 )
 
 type SettingID uint16
+
+// Defined in https://http2.github.io/http2-spec/#rfc.section.6.5
+const (
+	FlagSettingsAck Flags = 0x1
+)
 
 const (
 	SettingHeaderTableSize      SettingID = 0x1
