@@ -86,6 +86,7 @@ func knownSetting(id SettingID) bool {
 type frameParser func(FrameHeader, io.Reader) (Frame, error)
 
 var FrameParsers = map[FrameType]frameParser{
+	FrameContinuation: parseContinuationFrame,
 	FrameSettings:     parseSettingsFrame,
 	FrameWindowUpdate: parseWindowUpdateFrame,
 	FrameHeaders:      parseHeadersFrame,
@@ -257,6 +258,21 @@ type HeaderFrame struct {
 	HeaderFragBuf []byte
 }
 
+// isLastInStream returns true if no frames will be sent after this
+// HeaderFrame and any possible following ContinuationFrames. This
+// signals that the stream will be put in a half-closed state. Compare
+// to isContinued.
+func (hf HeaderFrame) isLastInStream() bool {
+	return hf.Flags.Has(FlagHeadersEndStream)
+}
+
+// isContinued returns true if there will be more header values sent
+// as ContinuationFrames after this HeaderFrame. Compare to
+// isLastInStream.
+func (hf HeaderFrame) isContinued() bool {
+	return !hf.Flags.Has(FlagHeadersEndHeaders)
+}
+
 func parseHeadersFrame(fh FrameHeader, r io.Reader) (_ Frame, err error) {
 	hf := HeaderFrame{
 		FrameHeader: fh,
@@ -292,9 +308,18 @@ func parseHeadersFrame(fh FrameHeader, r io.Reader) (_ Frame, err error) {
 			return
 		}
 	}
-	headerFragLen := int(fh.Length) - notHeaders
+	buf, err := parseHeaderFragment(r, fh.StreamID, fh.Length, padLength, notHeaders)
+	if err != nil {
+		return nil, err
+	}
+	hf.HeaderFragBuf = buf
+	return hf, nil
+}
+
+func parseHeaderFragment(r io.Reader, streamID uint32, totalLength uint16, padLength uint8, notHeaders int) ([]byte, error) {
+	headerFragLen := int(totalLength) - notHeaders
 	if headerFragLen <= 0 {
-		return nil, StreamError(fh.StreamID)
+		return nil, StreamError(streamID)
 	}
 	buf := make([]byte, headerFragLen)
 	if _, err := io.ReadFull(r, buf); err != nil {
@@ -303,8 +328,30 @@ func parseHeadersFrame(fh FrameHeader, r io.Reader) (_ Frame, err error) {
 	if _, err := io.CopyN(ioutil.Discard, r, int64(padLength)); err != nil {
 		return nil, err
 	}
-	hf.HeaderFragBuf = buf
-	return hf, nil
+	return buf, nil
+}
+
+type ContinuationFrame struct {
+	FrameHeader
+	HeaderFragBuf []byte
+}
+
+func parseContinuationFrame(fh FrameHeader, r io.Reader) (_ Frame, err error) {
+	cf := ContinuationFrame{
+		FrameHeader: fh,
+	}
+	buf, err := parseHeaderFragment(r, fh.StreamID, fh.Length, 0, 0)
+	if err != nil {
+		return nil, err
+	}
+	cf.HeaderFragBuf = buf
+	return cf, nil
+}
+
+// isContinued returns true if there will be more header values sent
+// as ContinuationFrames after this ContinuationFrame.
+func (cf ContinuationFrame) isContinued() bool {
+	return !cf.Flags.Has(FlagHeadersEndHeaders)
 }
 
 func readByte(r io.Reader) (uint8, error) {
