@@ -86,6 +86,7 @@ func knownSetting(id SettingID) bool {
 type frameParser func(FrameHeader, io.Reader) (Frame, error)
 
 var FrameParsers = map[FrameType]frameParser{
+	FrameContinuation: parseContinuationFrame,
 	FrameSettings:     parseSettingsFrame,
 	FrameWindowUpdate: parseWindowUpdateFrame,
 	FrameHeaders:      parseHeadersFrame,
@@ -332,6 +333,18 @@ func parseHeaderFragment(r io.Reader, streamID uint32, totalLength uint16, padLe
 type ContinuationFrame struct {
 	FrameHeader
 	HeaderFragBuf []byte
+}
+
+func parseContinuationFrame(fh FrameHeader, r io.Reader) (_ Frame, err error) {
+	cf := ContinuationFrame{
+		FrameHeader: fh,
+	}
+	buf, err := parseHeaderFragment(r, fh.StreamID, fh.Length, 0, 0)
+	if err != nil {
+		return nil, err
+	}
+	cf.HeaderFragBuf = buf
+	return cf, nil
 }
 
 // isContinued returns true if there will be more header values sent
