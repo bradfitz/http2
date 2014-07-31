@@ -76,8 +76,8 @@ func (cc *clientConn) serve(maxStreams int) {
 	}
 	s := &streamHandler{}
 	for {
-		// TODO(jmhodges): handle HeaderFrame sent on an already open
-		// stream where (that is, a HeaderFrame has already been seen)
+		// TODO(jmhodges): handle HeaderFrame sent on an open stream
+		// (that is, one where a HeaderFrame has already been seen)
 		fh, err := ReadFrameHeader(cc.c)
 		if err != nil {
 			if err != io.EOF {
