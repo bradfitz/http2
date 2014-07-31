@@ -1,15 +1,14 @@
 package http2
 
 import (
-	"errors"
 	"io"
 	"io/ioutil"
 	"log"
 )
 
 var (
-	ErrExpectedContinuation   = errors.New("http2: expected a Continuation frame to come next.")
-	ErrUnexpectedContinuation = errors.New("http2: no Continuation frame expected, but one arrived.")
+	ErrExpectedContinuation   = ConnectionError(ErrCodeProtocol)
+	ErrUnexpectedContinuation = ConnectionError(ErrCodeProtocol)
 )
 
 type streamHandler struct {
