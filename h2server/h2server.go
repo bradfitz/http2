@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
 	"time"
 
@@ -23,6 +24,7 @@ func main() {
 
 	log.Printf("Listening on https://localhost:4430/")
 	srv.Addr = "localhost:4430"
+	srv.ErrorLog = log.New(os.Stderr, "h2", 0)
 	http2.ConfigureServer(&srv, &http2.Server{})
 
 	closeFirefox()
