@@ -272,6 +272,7 @@ func (hf HeaderFrame) isLastInStream() bool {
 func (hf HeaderFrame) isContinued() bool {
 	return !hf.Flags.Has(FlagHeadersEndHeaders)
 }
+
 func parseHeadersFrame(fh FrameHeader, r io.Reader) (_ Frame, err error) {
 	hf := HeaderFrame{
 		FrameHeader: fh,
