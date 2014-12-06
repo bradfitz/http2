@@ -771,6 +771,9 @@ func parseHeadersFrame(fh FrameHeader, p []byte) (_ Frame, err error) {
 
 // HeadersFrameParam are the parameters for writing a HEADERS frame.
 type HeadersFrameParam struct {
+	// Write this header as a push promise.
+	PushPromise bool
+
 	// StreamID is the required Stream ID to initiate.
 	StreamID uint32
 	// BlockFragment is part (or all) of a Header Block.
@@ -779,7 +782,7 @@ type HeadersFrameParam struct {
 	// EndStream indicates that the header block is the last that
 	// the endpoint will send for the identified stream. Setting
 	// this flag causes the stream to enter one of "half closed"
-	// states.
+	// states. It is not sent if this write is a push promise.
 	EndStream bool
 
 	// EndHeaders indicates that this frame contains an entire
@@ -792,11 +795,14 @@ type HeadersFrameParam struct {
 	PadLength uint8
 
 	// Priority, if non-zero, includes stream priority information
-	// in the HEADER frame.
+	// in the HEADER frame. It is not sent if this write is a PushPromise.
 	Priority PriorityParam
+
+	// PromiseID is the promised stream if this write is a PushPromise.
+	PromiseID uint32
 }
 
-// WriteHeaders writes a single HEADERS frame.
+// WriteHeaders writes a single HEADERS or PUSH_PROMISE frame.
 //
 // This is a low-level header writing method. Encoding headers and
 // splitting them into any necessary CONTINUATION frames is handled
@@ -812,20 +818,24 @@ func (f *Framer) WriteHeaders(p HeadersFrameParam) error {
 	if p.PadLength != 0 {
 		flags |= FlagHeadersPadded
 	}
-	if p.EndStream {
+	if p.EndStream && !p.PushPromise {
 		flags |= FlagHeadersEndStream
 	}
 	if p.EndHeaders {
 		flags |= FlagHeadersEndHeaders
 	}
-	if !p.Priority.IsZero() {
+	if !p.Priority.IsZero() && !p.PushPromise {
 		flags |= FlagHeadersPriority
 	}
-	f.startWrite(FrameHeaders, flags, p.StreamID)
+	fh := FrameHeaders
+	if p.PushPromise {
+		fh = FramePushPromise
+	}
+	f.startWrite(fh, flags, p.StreamID)
 	if p.PadLength != 0 {
 		f.writeByte(p.PadLength)
 	}
-	if !p.Priority.IsZero() {
+	if !p.Priority.IsZero() && !p.PushPromise {
 		v := p.Priority.StreamDep
 		if !validStreamID(v) && !f.AllowIllegalWrites {
 			return errors.New("invalid dependent stream id")
@@ -836,6 +846,13 @@ func (f *Framer) WriteHeaders(p HeadersFrameParam) error {
 		f.writeUint32(v)
 		f.writeByte(p.Priority.Weight)
 	}
+	if p.PushPromise {
+		if !validStreamID(p.PromiseID) && !f.AllowIllegalWrites {
+			return errStreamID
+		}
+		f.writeUint32(p.PromiseID)
+	}
+
 	f.wbuf = append(f.wbuf, p.BlockFragment...)
 	f.wbuf = append(f.wbuf, padZeros[:p.PadLength]...)
 	return f.endWrite()
@@ -1024,59 +1041,6 @@ func parsePushPromise(fh FrameHeader, p []byte) (_ Frame, err error) {
 	}
 	pp.headerFragBuf = p[:len(p)-int(padLength)]
 	return pp, nil
-}
-
-// PushPromiseParam are the parameters for writing a PUSH_PROMISE frame.
-type PushPromiseParam struct {
-	// StreamID is the required Stream ID to initiate.
-	StreamID uint32
-
-	// PromiseID is the required Stream ID which this
-	// Push Promises
-	PromiseID uint32
-
-	// BlockFragment is part (or all) of a Header Block.
-	BlockFragment []byte
-
-	// EndHeaders indicates that this frame contains an entire
-	// header block and is not followed by any
-	// CONTINUATION frames.
-	EndHeaders bool
-
-	// PadLength is the optional number of bytes of zeros to add
-	// to this frame.
-	PadLength uint8
-}
-
-// WritePushPromise writes a single PushPromise Frame.
-//
-// As with Header Frames, This is the low level call for writing
-// individual frames. Continuation frames are handled elsewhere.
-//
-// It will perform exactly one Write to the underlying Writer.
-// It is the caller's responsibility to not call other Write methods concurrently.
-func (f *Framer) WritePushPromise(p PushPromiseParam) error {
-	if !validStreamID(p.StreamID) && !f.AllowIllegalWrites {
-		return errStreamID
-	}
-	var flags Flags
-	if p.PadLength != 0 {
-		flags |= FlagPushPromisePadded
-	}
-	if p.EndHeaders {
-		flags |= FlagPushPromiseEndHeaders
-	}
-	f.startWrite(FramePushPromise, flags, p.StreamID)
-	if p.PadLength != 0 {
-		f.writeByte(p.PadLength)
-	}
-	if !validStreamID(p.PromiseID) && !f.AllowIllegalWrites {
-		return errStreamID
-	}
-	f.writeUint32(p.PromiseID)
-	f.wbuf = append(f.wbuf, p.BlockFragment...)
-	f.wbuf = append(f.wbuf, padZeros[:p.PadLength]...)
-	return f.endWrite()
 }
 
 // WriteRawFrame writes a raw frame. This can be used to write

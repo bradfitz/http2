@@ -1191,11 +1191,12 @@ func TestServer_Rejects_Continuation0(t *testing.T) {
 
 func TestServer_Rejects_PushPromise(t *testing.T) {
 	testServerRejects(t, func(st *serverTester) {
-		pp := PushPromiseParam{
-			StreamID:  1,
-			PromiseID: 3,
+		pp := HeadersFrameParam{
+			PushPromise: true,
+			StreamID:    1,
+			PromiseID:   3,
 		}
-		if err := st.fr.WritePushPromise(pp); err != nil {
+		if err := st.fr.WriteHeaders(pp); err != nil {
 			t.Fatal(err)
 		}
 	})
