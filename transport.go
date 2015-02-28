@@ -25,8 +25,9 @@ import (
 type Transport struct {
 	Fallback http.RoundTripper
 
-	// TODO: remove this and make more general with a TLS dial hook, like http
-	InsecureTLSDial bool
+	// TLSClientConfig specifies the TLS configuration to use with
+	// tls.Client. If nil, the default configuration is used.
+	TLSClientConfig *tls.Config
 
 	connMu sync.Mutex
 	conns  map[string][]*clientConn // key is host:port
@@ -181,19 +182,23 @@ func (t *Transport) getClientConn(host, port string) (*clientConn, error) {
 }
 
 func (t *Transport) newClientConn(host, port, key string) (*clientConn, error) {
-	cfg := &tls.Config{
-		ServerName:         host,
-		NextProtos:         []string{NextProtoTLS},
-		InsecureSkipVerify: t.InsecureTLSDial,
+	var cfg tls.Config
+	if t.TLSClientConfig != nil {
+		cfg = *t.TLSClientConfig
 	}
-	tconn, err := tls.Dial("tcp", host+":"+port, cfg)
+	if cfg.ServerName == "" {
+		cfg.ServerName = host
+	}
+	cfg.NextProtos = []string{NextProtoTLS}
+
+	tconn, err := tls.Dial("tcp", host+":"+port, &cfg)
 	if err != nil {
 		return nil, err
 	}
 	if err := tconn.Handshake(); err != nil {
 		return nil, err
 	}
-	if !t.InsecureTLSDial {
+	if !cfg.InsecureSkipVerify {
 		if err := tconn.VerifyHostname(cfg.ServerName); err != nil {
 			return nil, err
 		}

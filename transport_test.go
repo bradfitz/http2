@@ -6,6 +6,7 @@
 package http2
 
 import (
+	"crypto/tls"
 	"flag"
 	"io"
 	"io/ioutil"
@@ -29,7 +30,7 @@ func TestTransportExternal(t *testing.T) {
 	}
 	req, _ := http.NewRequest("GET", "https://"+*transportHost+"/", nil)
 	rt := &Transport{
-		InsecureTLSDial: *insecure,
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: *insecure},
 	}
 	res, err := rt.RoundTrip(req)
 	if err != nil {
@@ -45,7 +46,7 @@ func TestTransport(t *testing.T) {
 	})
 	defer st.Close()
 
-	tr := &Transport{InsecureTLSDial: true}
+	tr := &Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	defer tr.CloseIdleConnections()
 
 	req, err := http.NewRequest("GET", st.ts.URL, nil)
@@ -92,7 +93,7 @@ func TestTransportReusesConns(t *testing.T) {
 		io.WriteString(w, r.RemoteAddr)
 	}, optOnlyServer)
 	defer st.Close()
-	tr := &Transport{InsecureTLSDial: true}
+	tr := &Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	defer tr.CloseIdleConnections()
 	get := func() string {
 		req, err := http.NewRequest("GET", st.ts.URL, nil)
@@ -137,9 +138,7 @@ func TestTransportAbortClosesPipes(t *testing.T) {
 	requestMade := make(chan struct{})
 	go func() {
 		defer close(done)
-		tr := &Transport{
-			InsecureTLSDial: true,
-		}
+		tr := &Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 		req, err := http.NewRequest("GET", st.ts.URL, nil)
 		if err != nil {
 			t.Fatal(err)
