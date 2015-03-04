@@ -6,6 +6,7 @@
 package http2
 
 import (
+	"bytes"
 	"flag"
 	"io"
 	"io/ioutil"
@@ -119,6 +120,34 @@ func TestTransportReusesConns(t *testing.T) {
 	if first != second {
 		t.Errorf("first and second responses were on different connections: %q vs %q", first, second)
 	}
+}
+
+func TestTransportPostBody(t *testing.T) {
+	want := `a not so very long request body`
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		body, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := string(body); want != got {
+			t.Errorf("want body %q, got %q", want, got)
+		}
+	})
+	defer st.Close()
+
+	tr := &Transport{InsecureTLSDial: true}
+	defer tr.CloseIdleConnections()
+
+	req, err := http.NewRequest("POST", st.ts.URL, bytes.NewBufferString(want))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
 }
 
 func TestTransportAbortClosesPipes(t *testing.T) {

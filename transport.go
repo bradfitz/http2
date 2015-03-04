@@ -304,7 +304,7 @@ func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	cs := cc.newStream()
-	hasBody := false // TODO
+	hasBody := req.Body != nil
 
 	// we send: HEADERS[+CONTINUATION] + (DATA?)
 	hdrs := cc.encodeHeaders(req)
@@ -333,8 +333,11 @@ func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	cc.mu.Unlock()
 
 	if hasBody {
-		// TODO: write data. and it should probably be interleaved:
-		//   go ... io.Copy(dataFrameWriter{cc, cs, ...}, req.Body) ... etc
+		go func(dst io.WriteCloser) {
+			defer dst.Close()
+			io.Copy(dst, req.Body)
+		}(dataFrameWriter{cc, cs})
+		// TODO(bgentry): trailers? can't close stream yet if there are trailers.
 	}
 
 	if werr != nil {
@@ -550,4 +553,29 @@ func (cc *clientConn) onNewHeaderField(f hpack.HeaderField) {
 		return
 	}
 	cc.nextRes.Header.Add(http.CanonicalHeaderKey(f.Name), f.Value)
+}
+
+type dataFrameWriter struct {
+	cc *clientConn
+	cs *clientStream
+}
+
+// Write sends a data frame with the contents of b.
+func (df dataFrameWriter) Write(b []byte) (int, error) {
+	df.cc.mu.Lock()
+	defer df.cc.mu.Unlock()
+	return len(b), df.cc.fr.WriteData(df.cs.ID, false, b)
+}
+
+// Close sends an empty data frame with the EndStream flag set, closing the
+// stream.
+func (df dataFrameWriter) Close() error {
+	df.cc.mu.Lock()
+	defer df.cc.mu.Unlock()
+
+	if err := df.cc.fr.WriteData(df.cs.ID, true, []byte{}); err != nil {
+		return err
+	}
+	df.cc.bw.Flush()
+	return nil
 }
