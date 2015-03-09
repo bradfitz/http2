@@ -201,9 +201,11 @@ func (srv *Server) handleConn(hs *http.Server, c net.Conn, h http.Handler) {
 		bw:               newBufferedWriter(c),
 		handler:          h,
 		streams:          make(map[uint32]*stream),
+		maxPushID:        2,
 		readFrameCh:      make(chan frameAndGate),
 		readFrameErrCh:   make(chan error, 1), // must be buffered for 1
 		wantWriteFrameCh: make(chan frameWriteMsg, 8),
+		pushPromiseCh:    make(chan *pushPromise, 1),
 		wroteFrameCh:     make(chan struct{}, 1), // buffered; one send in reading goroutine
 		bodyReadCh:       make(chan bodyReadMsg), // buffering doesn't matter either way
 		doneServing:      make(chan struct{}),
@@ -332,6 +334,7 @@ type serverConn struct {
 	readFrameCh      chan frameAndGate // written by serverConn.readFrames
 	readFrameErrCh   chan error
 	wantWriteFrameCh chan frameWriteMsg   // from handlers -> serve
+	pushPromiseCh    chan *pushPromise    // server loop receives push promises on this chan
 	wroteFrameCh     chan struct{}        // from writeFrameAsync -> serve, tickles more frame writes
 	bodyReadCh       chan bodyReadMsg     // from handlers -> serve
 	testHookCh       chan func()          // code to run on the serve loop
@@ -350,6 +353,7 @@ type serverConn struct {
 	advMaxStreams         uint32 // our SETTINGS_MAX_CONCURRENT_STREAMS advertised the client
 	curOpenStreams        uint32 // client's number of open streams
 	maxStreamID           uint32 // max ever seen
+	maxPushID             uint32 // maxID used for push
 	streams               map[uint32]*stream
 	initialWindowSize     int32
 	headerTableSize       uint32
@@ -370,9 +374,10 @@ type serverConn struct {
 	hpackEncoder   *hpack.Encoder
 }
 
-// requestParam is the state of the next request, initialized over
-// potentially several frames HEADERS + zero or more CONTINUATION
-// frames.
+// requestParam is the state of a request.
+// It is used in 2 places. One is as a accumulator of the state in
+// HEADERS + zero or more CONTINUATION frames in the read loop.
+// The other place is for constructing a push promise frame.
 type requestParam struct {
 	// stream is non-nil if we're reading (HEADER or CONTINUATION)
 	// frames for a request (but not DATA).
@@ -630,6 +635,8 @@ func (sc *serverConn) serve() {
 		select {
 		case wm := <-sc.wantWriteFrameCh:
 			sc.writeFrame(wm)
+		case pp := <-sc.pushPromiseCh:
+			sc.startPushPromise(pp)
 		case <-sc.wroteFrameCh:
 			sc.writingFrame = false
 			sc.scheduleFrameWrite()
@@ -837,6 +844,28 @@ func (sc *serverConn) scheduleFrameWrite() {
 		sc.needsFrameFlush = false // after startFrameWrite, since it sets this true
 		return
 	}
+}
+
+func (sc *serverConn) pushPromise(pp *pushPromise) error {
+	sc.serveG.checkNotOn() // NOT
+	st := pp.reqpm.stream
+	select {
+	case sc.pushPromiseCh <- pp:
+	case <-sc.doneServing:
+		return errClientDisconnected
+	case <-st.cw:
+		return errStreamBroken
+	}
+
+	select {
+	case err := <-pp.done:
+		return err
+	case <-sc.doneServing:
+		return errClientDisconnected
+	case <-st.cw:
+		return errStreamBroken
+	}
+
 }
 
 func (sc *serverConn) goAway(code ErrCode) {
@@ -1240,6 +1269,71 @@ func (sc *serverConn) processHeaders(f *HeadersFrame) error {
 	return sc.processHeaderBlockFragment(st, f.HeaderBlockFragment(), f.HeadersEnded())
 }
 
+var ErrPushDisabled = errors.New("http2: push attempted on connection where it is disabled")
+
+func (sc *serverConn) startPushPromise(pp *pushPromise) {
+	sc.serveG.check()
+	if !sc.pushEnabled {
+		pp.done <- ErrPushDisabled
+		return
+	}
+	assocStream := pp.reqpm.stream
+	promiseid := sc.maxPushID
+	sc.maxPushID += 2
+
+	// create the stream that is going to be pushed
+	st := &stream{
+		id:    promiseid,
+		state: stateResvLocal,
+	}
+	st.flow.conn = &sc.flow
+	st.flow.add(sc.initialWindowSize)
+	st.cw.Init()
+	sc.streams[promiseid] = st
+
+	// TODO(dmorsing): figure out if priority is
+	// a factor between the initiating stream and
+	// the pushed one
+
+	// A bit ugly: we use the stream field in
+	// reqpm to tell us which stream initiated this
+	// push, then overwrite it here with the created
+	// stream
+	pp.reqpm.stream = st
+
+	// We need to make sure that the push
+	// promise frame was sent to the client
+	// before we start handler.
+	// Otherwise, we might send the headers
+	// for the response before the push promise.
+	starthandlerCh := make(chan error, 1)
+	sc.writeFrame(frameWriteMsg{
+		&writePPHeaders{
+			streamID: assocStream.id,
+			reqpm:    &pp.reqpm,
+		},
+		assocStream,
+		starthandlerCh})
+	rw, req, err := sc.newWriterAndRequest(&pp.reqpm)
+	if err != nil {
+		panic("Created bad request for push")
+	}
+	go func() {
+		select {
+		case <-sc.doneServing:
+			return
+		case <-st.cw:
+			return
+		case err := <-starthandlerCh:
+			pp.done <- err
+			if err != nil {
+				return
+			}
+		}
+		sc.runHandler(rw, req)
+	}()
+}
+
 func (sc *serverConn) processContinuation(f *ContinuationFrame) error {
 	sc.serveG.check()
 	st := sc.streams[f.Header().StreamID]
@@ -1282,7 +1376,7 @@ func (sc *serverConn) processHeaderBlockFragment(st *stream, frag []byte, end bo
 		return StreamError{st.id, ErrCodeRefusedStream}
 	}
 
-	rw, req, err := sc.newWriterAndRequest()
+	rw, req, err := sc.newWriterAndRequest(&sc.req)
 	if err != nil {
 		return err
 	}
@@ -1341,9 +1435,8 @@ func (sc *serverConn) resetPendingRequest() {
 	sc.req = requestParam{}
 }
 
-func (sc *serverConn) newWriterAndRequest() (*responseWriter, *http.Request, error) {
+func (sc *serverConn) newWriterAndRequest(rp *requestParam) (*responseWriter, *http.Request, error) {
 	sc.serveG.check()
-	rp := &sc.req
 	if rp.invalidHeader || rp.method == "" || rp.path == "" ||
 		(rp.scheme != "https" && rp.scheme != "http") {
 		// See 8.1.2.6 Malformed Requests and Responses:
@@ -1581,6 +1674,7 @@ var (
 	_ http.CloseNotifier = (*responseWriter)(nil)
 	_ http.Flusher       = (*responseWriter)(nil)
 	_ stringWriter       = (*responseWriter)(nil)
+	_ Pusher             = (*responseWriter)(nil)
 )
 
 type responseWriterState struct {
@@ -1673,6 +1767,46 @@ func (w *responseWriter) Flush() {
 		// final DATA frame (with END_STREAM) to be sent.
 		rws.writeChunk(nil)
 	}
+}
+
+type pushPromise struct {
+	reqpm requestParam
+	done  chan error
+}
+
+// Pusher is an interface that http.ResponseWriters implement if they support server push
+// When Push is called, it will send a push promise to the client, using the method, path and
+// headers. It will then initiate the push by calling the server-level http.Handler
+// for the path.
+type Pusher interface {
+	Push(method string, path string, h http.Header) error
+}
+
+func (w *responseWriter) Push(method string, path string, h http.Header) error {
+	rws := w.rws
+	if rws == nil {
+		panic("Push called after Handler finished")
+	}
+	if h == nil {
+		h = rws.req.Header
+	}
+	switch method {
+	case "GET", "HEAD":
+	default:
+		return errors.New("http2: invalid method for push promise")
+	}
+	pp := pushPromise{
+		reqpm: requestParam{
+			stream:    rws.stream,
+			header:    cloneHeader(h),
+			method:    method,
+			path:      path,
+			scheme:    "https",
+			authority: rws.req.Host,
+		},
+		done: rws.frameWriteCh,
+	}
+	return rws.conn.pushPromise(&pp)
 }
 
 func (w *responseWriter) CloseNotify() <-chan bool {
