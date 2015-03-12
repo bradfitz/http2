@@ -217,6 +217,7 @@ func (srv *Server) handleConn(hs *http.Server, c net.Conn, h http.Handler) {
 		headerTableSize:   initialHeaderTableSize,
 		serveG:            newGoroutineLock(),
 		pushEnabled:       true,
+		clientMaxStreams:  100, // default according to rfc http://http2.github.io/http2-spec/#SettingValues
 	}
 	sc.flow.add(initialWindowSize)
 	sc.inflow.add(initialWindowSize)
@@ -352,6 +353,7 @@ type serverConn struct {
 	clientMaxStreams      uint32 // SETTINGS_MAX_CONCURRENT_STREAMS from client (our PUSH_PROMISE limit)
 	advMaxStreams         uint32 // our SETTINGS_MAX_CONCURRENT_STREAMS advertised the client
 	curOpenStreams        uint32 // client's number of open streams
+	curOpenPushStreams    uint32 // number of open streams initiated by server (PUSH)
 	maxStreamID           uint32 // max ever seen
 	maxPushID             uint32 // maxID used for push
 	streams               map[uint32]*stream
@@ -401,6 +403,7 @@ type stream struct {
 	id   uint32
 	body *pipe       // non-nil if expecting DATA frames
 	cw   closeWaiter // closed wait stream transitions to closed state
+	push bool        // only true for pushed streams
 
 	// owned by serverConn's serve loop:
 	bodyBytes     int64   // body bytes seen so far
@@ -433,7 +436,9 @@ func (sc *serverConn) state(streamID uint32) (streamState, *stream) {
 	// a client sends a HEADERS frame on stream 7 without ever sending a
 	// frame on stream 5, then stream 5 transitions to the "closed"
 	// state when the first frame for stream 7 is sent or received."
-	if streamID <= sc.maxStreamID {
+	if sc.isPushStream(streamID) && streamID <= sc.maxPushID {
+		return stateClosed, nil
+	} else if !sc.isPushStream(streamID) && streamID <= sc.maxStreamID {
 		return stateClosed, nil
 	}
 	return stateIdle, nil
@@ -1081,11 +1086,33 @@ func (sc *serverConn) processResetStream(f *RSTStreamFrame) error {
 
 func (sc *serverConn) closeStream(st *stream, err error) {
 	sc.serveG.check()
-	if st.state == stateIdle || st.state == stateClosed {
+	if st.state == stateIdle {
 		panic(fmt.Sprintf("invariant; can't close stream in state %v", st.state))
 	}
+
+	// If you push resource that page page does'n contain – FireFox v36 can send
+	// RST_STREAM on the stream several times. So just ignore it.
+	if st.state == stateClosed {
+		sc.vlogf("try to close alredy closed stream: %v", st.id)
+		return
+	}
+
+	if st.push && st.state != stateResvLocal {
+		// push streams in stateResvLocal don't increase counter curOpenPushStreams
+		//
+		// http://http2.github.io/http2-spec/#rfc.section.5.1.2
+		// Streams that are in the "open" state, or either of the "half closed"
+		// states count toward the maximum number of streams that an endpoint is
+		// permitted to open. Streams in any of these three states count toward
+		// the limit advertised in the SETTINGS_MAX_CONCURRENT_STREAMS setting.
+		// Streams in either of the "reserved" states do not count toward the
+		// stream limit.
+		sc.curOpenPushStreams--
+	} else {
+		sc.curOpenStreams--
+	}
+
 	st.state = stateClosed
-	sc.curOpenStreams--
 	delete(sc.streams, st.id)
 	if p := st.body; p != nil {
 		p.Close(err)
@@ -1230,7 +1257,7 @@ func (sc *serverConn) processHeaders(f *HeadersFrame) error {
 		return nil
 	}
 	// http://http2.github.io/http2-spec/#rfc.section.5.1.1
-	if id%2 != 1 || id <= sc.maxStreamID || sc.req.stream != nil {
+	if sc.isPushStream(id) || id <= sc.maxStreamID || sc.req.stream != nil {
 		// Streams initiated by a client MUST use odd-numbered
 		// stream identifiers. [...] The identifier of a newly
 		// established stream MUST be numerically greater than all
@@ -1270,6 +1297,7 @@ func (sc *serverConn) processHeaders(f *HeadersFrame) error {
 }
 
 var ErrPushDisabled = errors.New("http2: push attempted on connection where it is disabled")
+var ErrPushLimitReached = errors.New("http2: push attempted to send when SETTINGS_MAX_CONCURRENT_STREAMS is reached")
 
 func (sc *serverConn) startPushPromise(pp *pushPromise) {
 	sc.serveG.check()
@@ -1277,6 +1305,7 @@ func (sc *serverConn) startPushPromise(pp *pushPromise) {
 		pp.done <- ErrPushDisabled
 		return
 	}
+
 	assocStream := pp.reqpm.stream
 	promiseid := sc.maxPushID
 	sc.maxPushID += 2
@@ -1284,6 +1313,7 @@ func (sc *serverConn) startPushPromise(pp *pushPromise) {
 	// create the stream that is going to be pushed
 	st := &stream{
 		id:    promiseid,
+		push:  true,
 		state: stateResvLocal,
 	}
 	st.flow.conn = &sc.flow
@@ -1314,6 +1344,38 @@ func (sc *serverConn) startPushPromise(pp *pushPromise) {
 		},
 		assocStream,
 		starthandlerCh})
+
+	if sc.curOpenPushStreams >= sc.clientMaxStreams {
+		// http://http2.github.io/http2-spec/#PushResponses
+		// A client can use the SETTINGS_MAX_CONCURRENT_STREAMS setting to limit
+		// the number of responses that can be concurrently pushed by a server.
+		// Advertising a SETTINGS_MAX_CONCURRENT_STREAMS value of zero disables
+		// server push by preventing the server from creating the necessary
+		// streams. This does not prohibit a server from sending PUSH_PROMISE
+		// frames; clients need to reset any promised streams that are not
+		// wanted.
+		//
+		// http://http2.github.io/http2-spec/#rfc.section.5.1.2
+		// Streams that are in the "open" state, or either of the "half closed"
+		// states count toward the maximum number of streams that an endpoint
+		// is permitted to open. Streams in any of these three states count
+		// toward the limit advertised in the SETTINGS_MAX_CONCURRENT_STREAMS
+		// setting. Streams in either of the "reserved" states do not count
+		// toward the stream limit.
+		//
+		// An endpoint that wishes to reduce the value of
+		// SETTINGS_MAX_CONCURRENT_STREAMS to a value that is below the current
+		// number of open streams can either close streams that exceed the new
+		// value or allow streams to complete.
+
+		// nothing to do here
+		pp.done <- ErrPushLimitReached
+		return
+	}
+
+	// increment push counter on change state from reserved (local)
+	// TODO: (brk0v) mb increment right before sending frame?
+	sc.curOpenPushStreams++
 	rw, req, err := sc.newWriterAndRequest(&pp.reqpm)
 	if err != nil {
 		panic("Created bad request for push")
@@ -1330,8 +1392,19 @@ func (sc *serverConn) startPushPromise(pp *pushPromise) {
 				return
 			}
 		}
+
 		sc.runHandler(rw, req)
 	}()
+}
+
+func (sc *serverConn) isPushStream(id uint32) bool {
+	if id == 0 {
+		panic("internal error: tring to check state of the stream with id: 0")
+	}
+	if id%2 == 0 {
+		return true
+	}
+	return false
 }
 
 func (sc *serverConn) processContinuation(f *ContinuationFrame) error {
@@ -1535,11 +1608,17 @@ func (sc *serverConn) writeHeaders(st *stream, headerData *writeResHeaders, temp
 		// mutates it.
 		errc = tempCh
 	}
+
+	if st.push {
+		st.state = stateHalfClosedRemote
+	}
+
 	sc.writeFrameFromHandler(frameWriteMsg{
 		write:  headerData,
 		stream: st,
 		done:   errc,
 	})
+
 	if errc != nil {
 		select {
 		case <-errc:
@@ -1737,9 +1816,11 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 			return 0, nil
 		}
 	}
+
 	if len(p) == 0 && !rws.handlerDone {
 		return 0, nil
 	}
+
 	curWrite := &rws.curWrite
 	curWrite.streamID = rws.stream.id
 	curWrite.p = p
