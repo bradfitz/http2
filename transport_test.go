@@ -195,3 +195,58 @@ func TestTransportAbortClosesPipes(t *testing.T) {
 		t.Fatal("timeout")
 	}
 }
+
+func TestTransport_Response_LargeBody_FlowControlled(t *testing.T) {
+	shutdown := make(chan struct{})
+	const size = 10*initialWindowSize + 1
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		doneWriting := make(chan struct{})
+		go func() {
+			defer close(doneWriting)
+			_, err := w.Write(bytes.Repeat([]byte("a"), size))
+			if err != nil {
+				t.Fatal(err)
+			}
+		}()
+		select {
+		case <-doneWriting:
+		case <-shutdown:
+		}
+	})
+	defer st.Close()
+	defer close(shutdown) // we must shutdown before st.Close() to avoid hanging
+
+	done := make(chan struct{})
+	requestMade := make(chan struct{})
+	go func() {
+		defer close(done)
+		tr := &Transport{
+			InsecureTLSDial: true,
+		}
+		req, err := http.NewRequest("GET", st.ts.URL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := tr.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		close(requestMade)
+		body, err := ioutil.ReadAll(res.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(body) != size {
+			t.Errorf("want size %d, got %d", size, len(body))
+		}
+	}()
+
+	<-requestMade
+	// deadlock? that's a bug.
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout")
+	}
+}
