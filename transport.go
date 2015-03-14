@@ -329,27 +329,7 @@ func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	hasBody := req.Body != nil
 
 	// we send: HEADERS[+CONTINUATION] + (DATA?)
-	hdrs := cc.encodeHeaders(req)
-	first := true
-	for len(hdrs) > 0 {
-		chunk := hdrs
-		if len(chunk) > int(cc.maxFrameSize) {
-			chunk = chunk[:cc.maxFrameSize]
-		}
-		hdrs = hdrs[len(chunk):]
-		endHeaders := len(hdrs) == 0
-		if first {
-			cc.fr.WriteHeaders(HeadersFrameParam{
-				StreamID:      cs.ID,
-				BlockFragment: chunk,
-				EndStream:     !hasBody,
-				EndHeaders:    endHeaders,
-			})
-			first = false
-		} else {
-			cc.fr.WriteContinuation(cs.ID, endHeaders, chunk)
-		}
-	}
+	cc.writeHeaders(cs.ID, req)
 	cc.bw.Flush()
 	werr := cc.werr
 	cc.mu.Unlock()
@@ -358,7 +338,7 @@ func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
 		go func(dst io.WriteCloser) {
 			defer dst.Close()
 			io.Copy(dst, req.Body)
-		}(dataFrameWriter{cc, cs})
+		}(dataFrameWriter{cc, cs, req.Trailer})
 		// TODO(bgentry): trailers? can't close stream yet if there are trailers.
 	}
 
@@ -396,7 +376,12 @@ func (cc *clientConn) encodeHeaders(req *http.Request) []byte {
 	cc.writeHeader(":path", path)
 	cc.writeHeader(":scheme", "https")
 
-	for k, vv := range req.Header {
+	cc.encodeHeader(req.Header)
+	return cc.hbuf.Bytes()
+}
+
+func (cc *clientConn) encodeHeader(h http.Header) {
+	for k, vv := range h {
 		lowKey := strings.ToLower(k)
 		if lowKey == "host" {
 			continue
@@ -405,12 +390,51 @@ func (cc *clientConn) encodeHeaders(req *http.Request) []byte {
 			cc.writeHeader(lowKey, v)
 		}
 	}
+}
+
+// requires cc.mu be held.
+func (cc *clientConn) encodeTrailers(trailer http.Header) []byte {
+	cc.hbuf.Reset()
+	cc.encodeHeader(trailer)
 	return cc.hbuf.Bytes()
 }
 
 func (cc *clientConn) writeHeader(name, value string) {
 	log.Printf("sending %q = %q", name, value)
 	cc.henc.WriteField(hpack.HeaderField{Name: name, Value: value})
+}
+
+// requires cc.mu be held.
+func (cc *clientConn) writeHeaders(streamID uint32, req *http.Request) {
+	cc.splitAndWriteHeaders(streamID, cc.encodeHeaders(req), req.Body == nil)
+}
+
+// requires cc.mu be held.
+func (cc *clientConn) writeTrailers(streamID uint32, trailer http.Header) {
+	cc.splitAndWriteHeaders(streamID, cc.encodeTrailers(trailer), true)
+}
+
+func (cc *clientConn) splitAndWriteHeaders(streamID uint32, hdrs []byte, endStream bool) {
+	first := true
+	for len(hdrs) > 0 {
+		chunk := hdrs
+		if len(chunk) > int(cc.maxFrameSize) {
+			chunk = chunk[:cc.maxFrameSize]
+		}
+		hdrs = hdrs[len(chunk):]
+		endHeaders := len(hdrs) == 0
+		if first {
+			cc.fr.WriteHeaders(HeadersFrameParam{
+				StreamID:      streamID,
+				BlockFragment: chunk,
+				EndStream:     endStream,
+				EndHeaders:    endHeaders,
+			})
+			first = false
+		} else {
+			cc.fr.WriteContinuation(streamID, endHeaders, chunk)
+		}
+	}
 }
 
 type resAndError struct {
@@ -646,6 +670,7 @@ func (cc *clientConn) sendWindowUpdate32(cs *clientStream, n int32) {
 type dataFrameWriter struct {
 	cc *clientConn
 	cs *clientStream
+	tr http.Header
 }
 
 // Write sends a data frame with the contents of b.
@@ -655,15 +680,17 @@ func (df dataFrameWriter) Write(b []byte) (int, error) {
 	return len(b), df.cc.fr.WriteData(df.cs.ID, false, b)
 }
 
-// Close sends an empty data frame with the EndStream flag set, closing the
-// stream.
+// Close closes the stream with either a headers frame if Trailers were set, or
+// an empty data frame. In either case, the frame is sent with the EndStream
+// flag set.
 func (df dataFrameWriter) Close() error {
 	df.cc.mu.Lock()
 	defer df.cc.mu.Unlock()
+	defer df.cc.bw.Flush()
 
-	if err := df.cc.fr.WriteData(df.cs.ID, true, []byte{}); err != nil {
-		return err
+	if df.tr != nil {
+		df.cc.writeTrailers(df.cs.ID, df.tr)
+		return nil
 	}
-	df.cc.bw.Flush()
-	return nil
+	return df.cc.fr.WriteData(df.cs.ID, true, []byte{})
 }
