@@ -63,6 +63,7 @@ const (
 	firstSettingsTimeout  = 2 * time.Second // should be in-flight with preface anyway
 	handlerChunkWriteSize = 4 << 10
 	defaultMaxStreams     = 250 // TODO: make this 100 as the GFE seems to?
+	defaultWeight         = 16
 )
 
 var (
@@ -403,7 +404,6 @@ type stream struct {
 	id   uint32
 	body *pipe       // non-nil if expecting DATA frames
 	cw   closeWaiter // closed wait stream transitions to closed state
-	push bool        // only true for pushed streams
 
 	// owned by serverConn's serve loop:
 	bodyBytes     int64   // body bytes seen so far
@@ -1097,7 +1097,7 @@ func (sc *serverConn) closeStream(st *stream, err error) {
 		return
 	}
 
-	if st.push && st.state != stateResvLocal {
+	if sc.isPushStream(st.id) && st.state != stateResvLocal {
 		// push streams in stateResvLocal don't increase counter curOpenPushStreams
 		//
 		// http://http2.github.io/http2-spec/#rfc.section.5.1.2
@@ -1212,6 +1212,10 @@ func (sc *serverConn) processData(f *DataFrame) error {
 		// more DATA.
 		return StreamError{id, ErrCodeStreamClosed}
 	}
+	if sc.isPushStream(id) {
+		// Receiving data frame on a push stream.
+		return ConnectionError(ErrCodeProtocol)
+	}
 	if st.body == nil {
 		panic("internal error: should have a body in this state")
 	}
@@ -1311,10 +1315,14 @@ func (sc *serverConn) startPushPromise(pp *pushPromise) {
 	sc.maxPushID += 2
 
 	// create the stream that is going to be pushed
+	// 5.3.5 Default Priorities
+	// Pushed streams (Section 8.2) initially depend on their associated stream.
+	// In both cases, streams are assigned a default weight of 16.
 	st := &stream{
-		id:    promiseid,
-		push:  true,
-		state: stateResvLocal,
+		id:     promiseid,
+		state:  stateResvLocal,
+		parent: pp.reqpm.stream,
+		weight: defaultWeight,
 	}
 	st.flow.conn = &sc.flow
 	st.flow.add(sc.initialWindowSize)
@@ -1609,7 +1617,7 @@ func (sc *serverConn) writeHeaders(st *stream, headerData *writeResHeaders, temp
 		errc = tempCh
 	}
 
-	if st.push {
+	if sc.isPushStream(st.id) {
 		st.state = stateHalfClosedRemote
 	}
 
