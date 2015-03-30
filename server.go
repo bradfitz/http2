@@ -1211,9 +1211,7 @@ func (sc *serverConn) processHeaders(f *HeadersFrame) error {
 		// (Section 5.4.1) of type PROTOCOL_ERROR.
 		return ConnectionError(ErrCodeProtocol)
 	}
-	if id > sc.maxStreamID {
-		sc.maxStreamID = id
-	}
+	sc.maxStreamID = id
 	st := &stream{
 		id:    id,
 		state: stateOpen,
