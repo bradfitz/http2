@@ -562,6 +562,7 @@ func (c *conn) startFrameWrite(wm frameWriteMsg) {
 			st.id = c.nextStreamID
 			wm.stream = st
 			c.nextStreamID += 2
+			c.initializeFlowControl(st)
 			c.streams[st.id] = st
 
 			switch w := wm.write.(type) {
@@ -582,7 +583,14 @@ func (c *conn) startFrameWrite(wm frameWriteMsg) {
 
 		switch st.state {
 		case stateHalfClosedLocal:
-			panic("internal error: attempt to send frame on half-closed-local stream")
+			// A stream that is in the "half closed (local)" state
+			// cannot be used for sending frames other than
+			// WINDOW_UPDATE, PRIORITY and RST_STREAM.
+			switch wm.write.(type) {
+			case writeWindowUpdate, writePriority, StreamError:
+			default:
+				panic("internal error: attempt to send frame on half-closed-local stream")
+			}
 		case stateClosed:
 			if st.sentReset || st.gotReset {
 				// Skip this frame. But fake the frame write to reschedule:
@@ -606,17 +614,19 @@ func (c *conn) startFrameWrite(wm frameWriteMsg) {
 		}
 		switch st.state {
 		case stateOpen:
-			// Here we would go to stateHalfClosedLocal in
-			// theory, but since our handler is done and
-			// the net/http package provides no mechanism
-			// for finishing writing to a ResponseWriter
-			// while still reading data (see possible TODO
-			// at top of this file), we go into closed
-			// state here anyway, after telling the peer
-			// we're hanging up on them.
 			st.state = stateHalfClosedLocal // won't last long, but necessary for closeStream via resetStream
-			errCancel := StreamError{st.id, ErrCodeCancel}
-			c.resetStream(errCancel)
+			if !c.isClient {
+				// Here we would go to stateHalfClosedLocal in
+				// theory, but since our handler is done and
+				// the net/http package provides no mechanism
+				// for finishing writing to a ResponseWriter
+				// while still reading data (see possible TODO
+				// at top of this file), we go into closed
+				// state here anyway, after telling the peer
+				// we're hanging up on them.
+				errCancel := StreamError{st.id, ErrCodeCancel}
+				c.resetStream(errCancel)
+			}
 		case stateHalfClosedRemote:
 			c.closeStream(st, nil)
 		}
@@ -742,7 +752,7 @@ func (c *conn) processFrameFromReader(fg frameAndGate, fgValid bool) bool {
 
 	if fgValid {
 		f := fg.f
-		c.vlogf("got %v: %#v", f.Header(), f)
+		c.vlogf("client=%t got %v: %#v", c.isClient, f.Header(), f)
 		err = c.processFrame(f)
 		fg.g.Done() // unblock the readFrames goroutine
 		if err == nil {
@@ -990,7 +1000,7 @@ func (c *conn) processData(f *DataFrame) error {
 	// with a stream error (Section 5.4.2) of type STREAM_CLOSED."
 	id := f.Header().StreamID
 	st, ok := c.streams[id]
-	if !ok || st.state != stateOpen {
+	if !ok || !(st.state == stateOpen || (c.isClient && st.state == stateHalfClosedLocal)) {
 		// This includes sending a RST_STREAM if the stream is
 		// in stateHalfClosedLocal (which currently means that
 		// the http.Handler returned, so it's done reading &
@@ -1105,7 +1115,7 @@ func (c *conn) processHeaders(f *HeadersFrame) error {
 	if c.isClient {
 		var ok bool
 		st, ok = c.streams[id]
-		if !ok || st.state != stateOpen {
+		if !ok || !(st.state == stateOpen || st.state == stateHalfClosedLocal) {
 			c.logf("Received frame for untracked stream ID %d", id)
 			return ConnectionError(ErrCodeProtocol)
 		}
@@ -1120,12 +1130,7 @@ func (c *conn) processHeaders(f *HeadersFrame) error {
 	if f.StreamEnded() {
 		st.state = stateHalfClosedRemote
 	}
-
-	st.flow.conn = &c.flow // link to conn-level counter
-	st.flow.add(c.initialWindowSize)
-	st.inflow.conn = &c.inflow       // link to conn-level counter
-	st.inflow.add(initialWindowSize) // TODO: update this when we send a higher initial window size in the initial settings
-
+	c.initializeFlowControl(st)
 	c.streams[id] = st
 	if f.HasPriority() {
 		adjustStreamPriority(c.streams, st.id, f.Priority)
@@ -1136,6 +1141,14 @@ func (c *conn) processHeaders(f *HeadersFrame) error {
 		header: make(http.Header),
 	}
 	return c.processHeaderBlockFragment(st, f.HeaderBlockFragment(), f.HeadersEnded())
+}
+
+func (c *conn) initializeFlowControl(st *stream) {
+	c.runG.check()
+	st.flow.conn = &c.flow // link to conn-level counter
+	st.flow.add(c.initialWindowSize)
+	st.inflow.conn = &c.inflow       // link to conn-level counter
+	st.inflow.add(initialWindowSize) // TODO: update this when we send a higher initial window size in the initial settings
 }
 
 func (c *conn) processContinuation(f *ContinuationFrame) error {
@@ -1260,7 +1273,8 @@ func (c *conn) newResponse() (*http.Response, error) {
 		// otherwise the response is malformed (Section 8.1.2.6).
 		return nil, StreamError{rp.stream.id, ErrCodeProtocol}
 	}
-	bodyOpen := rp.stream.state == stateOpen
+	state := rp.stream.state
+	bodyOpen := (state == stateOpen || state == stateHalfClosedLocal)
 	body := &requestBody{
 		conn:   c,
 		stream: rp.stream,

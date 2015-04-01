@@ -278,7 +278,18 @@ func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	cc.conn.vlogf("created stream %d", st.id)
 
 	if hasBody {
-		// TODO(bgentry): support requests w/ body
+		defer req.Body.Close()
+		w := dataFrameWriter{
+			conn:         cc.conn,
+			st:           st,
+			curWrite:     writeData{streamID: st.id},
+			frameWriteCh: make(chan error, 1),
+		}
+		_, err := io.Copy(w, req.Body)
+		w.Close()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	re := <-resc
@@ -293,4 +304,34 @@ func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
 type resAndError struct {
 	res *http.Response
 	err error
+}
+
+type dataFrameWriter struct {
+	conn         *conn
+	st           *stream
+	curWrite     writeData
+	frameWriteCh chan error
+}
+
+// Write sends a data frame with the contents of b.
+func (df dataFrameWriter) Write(p []byte) (int, error) {
+	df.curWrite.p = p
+	return df.writeFrame()
+}
+
+// Close sends an empty data frame with the EndStream flag set, closing the
+// stream.
+func (df dataFrameWriter) Close() error {
+	df.curWrite.endStream = true
+	df.curWrite.p = nil
+	_, err := df.writeFrame()
+	return err
+}
+
+func (df dataFrameWriter) writeFrame() (int, error) {
+	n := len(df.curWrite.p)
+	if err := df.conn.writeDataFromExternal(df.st, &df.curWrite, df.frameWriteCh); err != nil {
+		return 0, err
+	}
+	return n, nil
 }

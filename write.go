@@ -99,6 +99,20 @@ func (w writePingAck) writeFrame(ctx writeContext) error {
 	return ctx.Framer().WritePing(true, w.pf.Data)
 }
 
+type writePriority struct {
+	streamID, streamDep uint32
+	exclusive           bool
+	weight              uint8
+}
+
+func (w writePriority) writeFrame(ctx writeContext) error {
+	return ctx.Framer().WritePriority(w.streamID, PriorityParam{
+		Exclusive: w.exclusive,
+		StreamDep: w.streamID,
+		Weight:    w.weight,
+	})
+}
+
 type writeSettingsAck struct{}
 
 func (writeSettingsAck) writeFrame(ctx writeContext) error {
