@@ -17,18 +17,47 @@ import (
 	"github.com/bradfitz/http2/hpack"
 )
 
-// requestParam is the state of the next request, initialized over
-// potentially several frames HEADERS + zero or more CONTINUATION
-// frames.
-type requestParam struct {
+// msgParam is the state of the next message (request or response),
+// initialized over potentially several frames HEADERS + zero or more
+// CONTINUATION frames.
+type msgParam struct {
 	// stream is non-nil if we're reading (HEADER or CONTINUATION)
-	// frames for a request (but not DATA).
+	// frames for a message (but not DATA).
 	stream            *stream
+	parent            *stream // for push promises
 	header            http.Header
 	method, path      string
 	scheme, authority string
+	status            int  // for responses
 	sawRegularHeader  bool // saw a non-pseudo header already
 	invalidHeader     bool // an invalid header was seen
+	isPushPromise     bool
+}
+
+// stream represents a stream. This is the minimal metadata needed by
+// the serve goroutine. Most of the actual stream state is owned by
+// the http.Handler's goroutine in the responseWriter. Because the
+// responseWriter's responseWriterState is recycled at the end of a
+// handler, this struct intentionally has no pointer to the
+// *responseWriter{,State} itself, as the Handler ending nils out the
+// responseWriter's state field.
+type stream struct {
+	// immutable:
+	id   uint32
+	body *pipe              // non-nil if expecting DATA frames
+	cw   closeWaiter        // closed wait stream transitions to closed state
+	resc chan<- resAndError // non-nil if expecting response
+
+	// owned by conn's run loop:
+	bodyBytes     int64   // body bytes seen so far
+	declBodyBytes int64   // or -1 if undeclared
+	flow          flow    // limits writing to peer
+	inflow        flow    // what the peer is allowed to write to us
+	parent        *stream // or nil
+	weight        uint8
+	state         streamState
+	sentReset     bool // only true once detached from streams map
+	gotReset      bool // only true once detacted from streams map
 }
 
 type conn struct {
@@ -50,8 +79,10 @@ type conn struct {
 	remoteAddrStr    string
 	logger           *log.Logger
 	maxReadFrameSize uint32
-	isClientConn     bool                                 // indicates whether the conn is a client conn or server conn
+	isClient         bool                                 // indicates whether the conn is a client conn or server conn
 	onRequest        func(*responseWriter, *http.Request) // server only
+	// if recvGoAwayCh is non-nil, GoAway frames received are sent here
+	recvGoAwayCh chan *GoAwayFrame
 
 	// Everything following is owned by the serve loop; use runG.check():
 	runG                  goroutineLock // used to verify funcs are on run()
@@ -63,21 +94,22 @@ type conn struct {
 	advMaxStreams         uint32 // our SETTINGS_MAX_CONCURRENT_STREAMS advertised to the peer
 	curOpenStreams        uint32 // peer's number of open streams
 	maxStreamID           uint32 // max ever seen
+	nextStreamID          uint32 // ID for next stream we create
 	streams               map[uint32]*stream
 	initialWindowSize     int32
 	headerTableSize       uint32
 	maxHeaderListSize     uint32            // zero means unknown (default)
 	canonHeader           map[string]string // http2-lower-case -> Go-Canonical-Case
-	// TODO(bgentry): rename to somethihng like msg and msgParam:
-	req              requestParam // non-zero while reading request headers
-	writingFrame     bool         // started write goroutine but haven't heard back on wroteFrameCh
-	needsFrameFlush  bool         // last frame write wasn't a flush
-	writeSched       writeScheduler
-	inGoAway         bool // we've started to or sent GOAWAY
-	needToSendGoAway bool // we need to schedule a GOAWAY frame write
-	goAwayCode       ErrCode
-	shutdownTimerCh  <-chan time.Time // nil until used
-	shutdownTimer    *time.Timer      // nil until used
+	msg                   msgParam          // non-zero while reading message headers
+	writingFrame          bool              // started write goroutine but haven't heard back on wroteFrameCh
+	needsFrameFlush       bool              // last frame write wasn't a flush
+	writeSched            writeScheduler
+	inGoAway              bool // we've started to or sent GOAWAY
+	needToSendGoAway      bool // we need to schedule a GOAWAY frame write
+	goAwayCode            ErrCode
+	recvGoAway            *GoAwayFrame
+	shutdownTimerCh       <-chan time.Time // nil until used
+	shutdownTimer         *time.Timer      // nil until used
 
 	// Owned by the writeFrameAsync goroutine:
 	headerWriteBuf bytes.Buffer
@@ -97,7 +129,9 @@ func (c *conn) run() {
 		return
 	}
 
-	if !c.isClientConn {
+	if c.isClient {
+		c.sendWindowUpdate(nil, 1<<30) // um, 0x7fffffff doesn't work to Google? it hangs?
+	} else {
 		if err := c.readClientPreface(); err != nil {
 			c.condlogf(err, "error reading client preface %v: %v", c.conn.RemoteAddr(), err)
 			return
@@ -167,12 +201,10 @@ func (c *conn) readClientPreface() error {
 }
 
 func (c *conn) writePreface() error {
-	if c.isClientConn {
+	if c.isClient {
 		if _, err := c.bw.Write(clientPreface); err != nil {
 			return err
 		}
-		c.writeFrame(frameWriteMsg{write: writeSettings{}})
-		return nil
 	}
 	c.writeFrame(frameWriteMsg{
 		write: writeSettings{
@@ -233,9 +265,26 @@ func (c *conn) writeFrameFromExternal(wm frameWriteMsg) {
 	}
 }
 
+// called from transport goroutines (and maybe handlers for PUSH_PROMISE).
+func (c *conn) createStreamFromExternal(headerData *writeReqHeaders, resc chan resAndError, ch chan error) (*stream, error) {
+	st := &stream{resc: resc}
+	st.cw.Init()
+	c.writeFrameFromExternal(frameWriteMsg{
+		write:  headerData,
+		stream: st,
+		done:   ch,
+	})
+	select {
+	case err := <-ch:
+		return st, err
+	case <-c.done:
+		return nil, errClientDisconnected
+	}
+}
+
 // called from handler goroutines.
 // h may be nil.
-func (c *conn) writeHeaders(st *stream, headerData *writeResHeaders, tempCh chan error) {
+func (c *conn) writeHeadersFromExternal(st *stream, headerData *writeResHeaders, tempCh chan error) {
 	c.runG.checkNotOn() // NOT on
 	var errc chan error
 	if headerData.h != nil {
@@ -334,23 +383,43 @@ func (c *conn) onNewHeaderField(f hpack.HeaderField) {
 	c.vlogf("got header field %+v", f)
 	switch {
 	case !validHeader(f.Name):
-		c.req.invalidHeader = true
+		c.msg.invalidHeader = true
 	case strings.HasPrefix(f.Name, ":"):
-		if c.req.sawRegularHeader {
+		if c.msg.sawRegularHeader {
 			c.logf("pseudo-header after regular header")
-			c.req.invalidHeader = true
+			c.msg.invalidHeader = true
 			return
 		}
+		// If we're a client and this is not a push promise, treat it as a response.
+		if c.isClient && !c.msg.isPushPromise {
+			if f.Name != ":status" {
+				c.logf("invalid pseudo-header %q", f.Name)
+				c.msg.invalidHeader = true
+				return
+			}
+			if c.msg.status != 0 {
+				c.logf("duplicate pseudo-header %q sent", f.Name)
+				c.msg.invalidHeader = true
+				return
+			}
+			var err error
+			if c.msg.status, err = strconv.Atoi(f.Value); err != nil {
+				c.logf("invalid :status header %q sent: %s", f.Value, err)
+				c.msg.invalidHeader = true
+			}
+			return
+		}
+
 		var dst *string
 		switch f.Name {
 		case ":method":
-			dst = &c.req.method
+			dst = &c.msg.method
 		case ":path":
-			dst = &c.req.path
+			dst = &c.msg.path
 		case ":scheme":
-			dst = &c.req.scheme
+			dst = &c.msg.scheme
 		case ":authority":
-			dst = &c.req.authority
+			dst = &c.msg.authority
 		default:
 			// 8.1.2.1 Pseudo-Header Fields
 			// "Endpoints MUST treat a request or response
@@ -358,25 +427,25 @@ func (c *conn) onNewHeaderField(f hpack.HeaderField) {
 			// pseudo-header fields as malformed (Section
 			// 8.1.2.6)."
 			c.logf("invalid pseudo-header %q", f.Name)
-			c.req.invalidHeader = true
+			c.msg.invalidHeader = true
 			return
 		}
 		if *dst != "" {
 			c.logf("duplicate pseudo-header %q sent", f.Name)
-			c.req.invalidHeader = true
+			c.msg.invalidHeader = true
 			return
 		}
 		*dst = f.Value
 	case f.Name == "cookie":
-		c.req.sawRegularHeader = true
-		if s, ok := c.req.header["Cookie"]; ok && len(s) == 1 {
+		c.msg.sawRegularHeader = true
+		if s, ok := c.msg.header["Cookie"]; ok && len(s) == 1 {
 			s[0] = s[0] + "; " + f.Value
 		} else {
-			c.req.header.Add("Cookie", f.Value)
+			c.msg.header.Add("Cookie", f.Value)
 		}
 	default:
-		c.req.sawRegularHeader = true
-		c.req.header.Add(c.canonicalHeader(f.Name), f.Value)
+		c.msg.sawRegularHeader = true
+		c.msg.header.Add(c.canonicalHeader(f.Name), f.Value)
 	}
 }
 
@@ -488,6 +557,29 @@ func (c *conn) startFrameWrite(wm frameWriteMsg) {
 
 	st := wm.stream
 	if st != nil {
+		if st.id == 0 { // create a new stream
+			st.state = stateOpen
+			st.id = c.nextStreamID
+			wm.stream = st
+			c.nextStreamID += 2
+			c.streams[st.id] = st
+
+			switch w := wm.write.(type) {
+			case *writeReqHeaders:
+				w.streamID = st.id
+			case *writePushPromise:
+				w.streamID = st.id
+				// A stream in the "reserved (local)" state is one that
+				// has been promised by sending a PUSH_PROMISE frame. A
+				// PUSH_PROMISE frame reserves an idle stream by
+				// associating the stream with an open stream that was
+				// initiated by the remote peer.
+				st.state = stateResvLocal
+			default:
+				panic(fmt.Sprintf("unhandled frame type for stream create: %v", w))
+			}
+		}
+
 		switch st.state {
 		case stateHalfClosedLocal:
 			panic("internal error: attempt to send frame on half-closed-local stream")
@@ -498,6 +590,11 @@ func (c *conn) startFrameWrite(wm frameWriteMsg) {
 				return
 			}
 			panic(fmt.Sprintf("internal error: attempt to send a write %v on a closed stream", wm))
+		}
+
+		if c.recvGoAway != nil && st.id > c.recvGoAway.LastStreamID {
+			wm.done <- errClientConnClosed
+			return
 		}
 	}
 
@@ -609,7 +706,7 @@ func (c *conn) resetStream(se StreamError) {
 // next frame must be a CONTINUATION with this stream id.
 func (c *conn) curHeaderStreamID() uint32 {
 	c.runG.check()
-	st := c.req.stream
+	st := c.msg.stream
 	if st == nil {
 		return 0
 	}
@@ -696,6 +793,8 @@ func (c *conn) processFrame(f Frame) error {
 	switch f := f.(type) {
 	case *SettingsFrame:
 		return c.processSettings(f)
+	case *GoAwayFrame:
+		return c.processGoAway(f)
 	case *HeadersFrame:
 		return c.processHeaders(f)
 	case *ContinuationFrame:
@@ -711,7 +810,7 @@ func (c *conn) processFrame(f Frame) error {
 	case *PriorityFrame:
 		return c.processPriority(f)
 	case *PushPromiseFrame:
-		// TODO(bgentry): allow these frames from clients. Restrict other frame
+		// TODO(bgentry): allow these frames for clients. Restrict other frame
 		// types where appropriate.
 
 		// A client cannot push. Thus, servers MUST treat the receipt of a PUSH_PROMISE
@@ -796,6 +895,13 @@ func (c *conn) closeStream(st *stream, err error) {
 	delete(c.streams, st.id)
 	if p := st.body; p != nil {
 		p.Close(err)
+	}
+	if ch := st.resc; ch != nil {
+		select {
+		case ch <- resAndError{nil, err}:
+		default:
+			panic(fmt.Sprintf("unbuffered done channel passed in for resc on stream %d", st.id))
+		}
 	}
 	st.cw.Close() // signals Handler's CloseNotifier, unblocks writes, etc
 	c.writeSched.forgetStream(st.id)
@@ -919,12 +1025,49 @@ func (c *conn) processData(f *DataFrame) error {
 	}
 	if f.StreamEnded() {
 		if st.declBodyBytes != -1 && st.declBodyBytes != st.bodyBytes {
-			st.body.Close(fmt.Errorf("request declared a Content-Length of %d but only wrote %d bytes",
-				st.declBodyBytes, st.bodyBytes))
+			msgType := "request"
+			if c.isClient {
+				msgType = "response"
+			}
+			st.body.Close(fmt.Errorf("%s declared a Content-Length of %d but only wrote %d bytes",
+				msgType, st.declBodyBytes, st.bodyBytes))
 		} else {
 			st.body.Close(io.EOF)
 		}
 		st.state = stateHalfClosedRemote
+	}
+	return nil
+}
+
+func (c *conn) processGoAway(f *GoAwayFrame) error {
+	c.runG.check()
+	// The GOAWAY frame (type=0x7) informs the remote peer to stop creating
+	// streams on this connection. GOAWAY can be sent by either the client or the
+	// server. Once sent, the sender will ignore frames sent on any new streams
+	// with identifiers higher than the included last stream identifier. Receivers
+	// of a GOAWAY frame MUST NOT open additional streams on the connection,
+	// although a new connection can be established for new streams.
+	c.recvGoAway = f
+	for _, st := range c.streams {
+		if st.id > f.LastStreamID {
+			if f.ErrCode == ErrCodeNo {
+				c.closeStream(st, errClientConnClosed)
+			} else {
+				c.closeStream(st, ConnectionError(f.ErrCode))
+			}
+		}
+	}
+
+	if ch := c.recvGoAwayCh; ch != nil {
+		select {
+		case ch <- f:
+		default:
+			panic("unbuffered recvGoAwayCh passed in for conn")
+		}
+	}
+	if f.ErrCode != 0 {
+		// TODO: deal with GOAWAY more. particularly the error code
+		c.logf("conn got GOAWAY with error code = %v", f.ErrCode)
 	}
 	return nil
 }
@@ -936,32 +1079,47 @@ func (c *conn) processHeaders(f *HeadersFrame) error {
 		// Ignore.
 		return nil
 	}
-	// TODO(bgentry): update to handle both client or server stream IDs. If
-	// client, we should already know about this stream ID because we had to
-	// request it, unless of course this is a server push. If server, register the
-	// stream. Also, include the appropriate spec sections for both types of
-	// stream identifiers.
-	//
+
 	// http://http2.github.io/http2-spec/#rfc.section.5.1.1
-	if id%2 != 1 || id <= c.maxStreamID || c.req.stream != nil {
+	if (!c.isClient && (id%2 != 1 || c.msg.stream != nil)) ||
+		(c.isClient && id%2 != 1 && !c.msg.isPushPromise) ||
+		id <= c.maxStreamID ||
+		id == 0 {
 		// Streams initiated by a client MUST use odd-numbered
-		// stream identifiers. [...] The identifier of a newly
-		// established stream MUST be numerically greater than all
-		// streams that the initiating endpoint has opened or
-		// reserved. [...]  An endpoint that receives an unexpected
-		// stream identifier MUST respond with a connection error
-		// (Section 5.4.1) of type PROTOCOL_ERROR.
+		// stream identifiers; those initiated by the server MUST
+		// use even-numbered stream identifiers. [...] the stream
+		// identifier zero cannot be used to establish a new stream.
+		// The identifier of a newly established stream MUST be
+		// numerically greater than all streams that the initiating
+		// endpoint has opened or reserved. [...] An endpoint that
+		// receives an unexpected stream identifier MUST respond
+		// with a connection error (Section 5.4.1) of type
+		// PROTOCOL_ERROR.
 		return ConnectionError(ErrCodeProtocol)
 	}
-	c.maxStreamID = id
-	st := &stream{
-		id:    id,
-		state: stateOpen,
+	// We should already know about this stream ID if this is a
+	// client receiving a response to a previous request or
+	// PUSH_PROMISE. Verify that it's a known stream ID if we're a
+	// client.
+	var st *stream
+	if c.isClient {
+		var ok bool
+		st, ok = c.streams[id]
+		if !ok || st.state != stateOpen {
+			c.logf("Received frame for untracked stream ID %d", id)
+			return ConnectionError(ErrCodeProtocol)
+		}
+	} else {
+		st = &stream{
+			id:    id,
+			state: stateOpen,
+		}
+		st.cw.Init()
 	}
+	c.maxStreamID = id
 	if f.StreamEnded() {
 		st.state = stateHalfClosedRemote
 	}
-	st.cw.Init()
 
 	st.flow.conn = &c.flow // link to conn-level counter
 	st.flow.add(c.initialWindowSize)
@@ -973,7 +1131,7 @@ func (c *conn) processHeaders(f *HeadersFrame) error {
 		adjustStreamPriority(c.streams, st.id, f.Priority)
 	}
 	c.curOpenStreams++
-	c.req = requestParam{
+	c.msg = msgParam{
 		stream: st,
 		header: make(http.Header),
 	}
@@ -1003,12 +1161,7 @@ func (c *conn) processHeaderBlockFragment(st *stream, frag []byte, end bool) err
 		return err
 	}
 
-	// TODO(bgentry): Now that we have the entire set of headers, we need to
-	// branch depending on whether we're a transport or server. Transports would
-	// send this as an http.Response back to the RoundTrip call that's waiting for
-	// it. Servers call the handler as shown below.
-
-	defer c.resetPendingRequest()
+	defer c.resetPendingMessage()
 	if c.curOpenStreams > c.advMaxStreams {
 		// "Endpoints MUST NOT exceed the limit set by their
 		// peer. An endpoint that receives a HEADERS frame
@@ -1026,6 +1179,16 @@ func (c *conn) processHeaderBlockFragment(st *stream, frag []byte, end bool) err
 		// a way for users to adjust server parameters at
 		// runtime.
 		return StreamError{st.id, ErrCodeRefusedStream}
+	}
+
+	if c.isClient && !c.msg.isPushPromise {
+		res, err := c.newResponse()
+		if st.resc != nil {
+			st.resc <- resAndError{res, err}
+		}
+		st.body = res.Body.(*requestBody).pipe // may be nil
+		st.declBodyBytes = res.ContentLength
+		return err
 	}
 
 	rw, req, err := c.newWriterAndRequest()
@@ -1079,17 +1242,55 @@ func adjustStreamPriority(streams map[uint32]*stream, streamID uint32, priority 
 	}
 }
 
-// resetPendingRequest zeros out all state related to a HEADERS frame
+// resetPendingMessage zeros out all state related to a HEADERS frame
 // and its zero or more CONTINUATION frames sent to start a new
-// request.
-func (c *conn) resetPendingRequest() {
+// message (request or response).
+func (c *conn) resetPendingMessage() {
 	c.runG.check()
-	c.req = requestParam{}
+	c.msg = msgParam{}
+}
+
+func (c *conn) newResponse() (*http.Response, error) {
+	c.runG.check()
+	rp := &c.msg
+	if rp.invalidHeader || rp.status == 0 {
+		// For HTTP/2 responses, a single :status pseudo-header field
+		// is defined that carries the HTTP status code field. This
+		// pseudo-header field MUST be included in all responses,
+		// otherwise the response is malformed (Section 8.1.2.6).
+		return nil, StreamError{rp.stream.id, ErrCodeProtocol}
+	}
+	bodyOpen := rp.stream.state == stateOpen
+	body := &requestBody{
+		conn:   c,
+		stream: rp.stream,
+	}
+	res := &http.Response{
+		Proto:      "HTTP/2.0",
+		ProtoMajor: 2,
+		Header:     rp.header,
+		StatusCode: rp.status,
+		Status:     httpCodeString(rp.status) + " " + http.StatusText(rp.status),
+		TLS:        c.tlsState,
+		Body:       body,
+	}
+	if bodyOpen {
+		body.pipe = &pipe{
+			b: buffer{buf: make([]byte, initialWindowSize)}, // TODO: share/remove XXX
+		}
+		body.pipe.c.L = &body.pipe.m
+		if vv, ok := rp.header["Content-Length"]; ok {
+			res.ContentLength, _ = strconv.ParseInt(vv[0], 10, 64)
+		} else {
+			res.ContentLength = -1
+		}
+	}
+	return res, nil
 }
 
 func (c *conn) newWriterAndRequest() (*responseWriter, *http.Request, error) {
 	c.runG.check()
-	rp := &c.req
+	rp := &c.msg
 	if rp.invalidHeader || rp.method == "" || rp.path == "" ||
 		(rp.scheme != "https" && rp.scheme != "http") {
 		// See 8.1.2.6 Malformed Requests and Responses:

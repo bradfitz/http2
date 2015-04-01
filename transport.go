@@ -6,8 +6,6 @@
 package http2
 
 import (
-	"bufio"
-	"bytes"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -15,8 +13,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"strconv"
-	"strings"
 	"sync"
 
 	"github.com/bradfitz/http2/hpack"
@@ -28,57 +24,42 @@ type Transport struct {
 	// TODO: remove this and make more general with a TLS dial hook, like http
 	InsecureTLSDial bool
 
+	// MaxConcurrentStreams optionally specifies the number of
+	// concurrent streams that each client may have open at a
+	// time. This is unrelated to the number of http.Handler goroutines
+	// which may be active globally, which is MaxHandlers.
+	// If zero, MaxConcurrentStreams defaults to at least 100, per
+	// the HTTP/2 spec's recommendations.
+	MaxConcurrentStreams uint32
+
+	// MaxReadFrameSize optionally specifies the largest frame
+	// this server is willing to read. A valid value is between
+	// 16k and 16M, inclusive. If zero or otherwise invalid, a
+	// default value is used.
+	MaxReadFrameSize uint32
+
 	connMu sync.Mutex
 	conns  map[string][]*clientConn // key is host:port
 }
 
-type clientConn struct {
-	t        *Transport
-	tconn    *tls.Conn
-	tlsState *tls.ConnectionState
-	connKey  []string // key(s) this connection is cached in, in t.conns
-
-	readerDone chan struct{} // closed on error
-	readerErr  error         // set before readerDone is closed
-	hdec       *hpack.Decoder
-	nextRes    *http.Response
-
-	mu           sync.Mutex
-	closed       bool
-	goAway       *GoAwayFrame // if non-nil, the GoAwayFrame we received
-	streams      map[uint32]*clientStream
-	nextStreamID uint32
-	bw           *bufio.Writer
-	werr         error // first write error that has occurred
-	br           *bufio.Reader
-	fr           *Framer
-	// Settings from peer:
-	maxFrameSize         uint32
-	maxConcurrentStreams uint32
-	initialWindowSize    uint32
-	hbuf                 bytes.Buffer // HPACK encoder writes into this
-	henc                 *hpack.Encoder
-}
-
-type clientStream struct {
-	ID   uint32
-	resc chan resAndError
-	pw   *io.PipeWriter
-	pr   *io.PipeReader
-}
-
-type stickyErrWriter struct {
-	w   io.Writer
-	err *error
-}
-
-func (sew stickyErrWriter) Write(p []byte) (n int, err error) {
-	if *sew.err != nil {
-		return 0, *sew.err
+func (t *Transport) maxReadFrameSize() uint32 {
+	if v := t.MaxReadFrameSize; v >= minMaxFrameSize && v <= maxFrameSize {
+		return v
 	}
-	n, err = sew.w.Write(p)
-	*sew.err = err
-	return
+	return defaultMaxReadFrameSize
+}
+
+func (t *Transport) maxConcurrentStreams() uint32 {
+	if v := t.MaxConcurrentStreams; v > 0 {
+		return v
+	}
+	return defaultMaxStreams
+}
+
+type clientConn struct {
+	t       *Transport
+	conn    *conn
+	connKey []string // key(s) this connection is cached in, in t.conns
 }
 
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -165,9 +146,10 @@ func (t *Transport) getClientConn(host, port string) (*clientConn, error) {
 	key := net.JoinHostPort(host, port)
 
 	for _, cc := range t.conns[key] {
-		if cc.canTakeNewRequest() {
-			return cc, nil
-		}
+		// TODO(bgentry): this used to check cc.canTakeNewRequest() to check if
+		// we're already at max # of streams, but current conn doesn't make that
+		// available outside the run loop.
+		return cc, nil
 	}
 	if t.conns == nil {
 		t.conns = make(map[string][]*clientConn)
@@ -177,6 +159,15 @@ func (t *Transport) getClientConn(host, port string) (*clientConn, error) {
 		return nil, err
 	}
 	t.conns[key] = append(t.conns[key], cc)
+	go func() {
+		defer t.removeClientConn(cc)
+
+		select {
+		case <-cc.conn.done:
+		case gf := <-cc.conn.recvGoAwayCh:
+			log.Printf("Transport received GoAway: %+v", gf)
+		}
+	}()
 	return cc, nil
 }
 
@@ -206,348 +197,100 @@ func (t *Transport) newClientConn(host, port, key string) (*clientConn, error) {
 	if !state.NegotiatedProtocolIsMutual {
 		return nil, errors.New("could not negotiate protocol mutually")
 	}
-	if _, err := tconn.Write(clientPreface); err != nil {
-		return nil, err
-	}
 
 	cc := &clientConn{
-		t:                    t,
-		tconn:                tconn,
-		connKey:              []string{key}, // TODO: cert's validated hostnames too
-		tlsState:             &state,
-		readerDone:           make(chan struct{}),
-		nextStreamID:         1,
-		maxFrameSize:         16 << 10, // spec default
-		initialWindowSize:    65535,    // spec default
-		maxConcurrentStreams: 1000,     // "infinite", per spec. 1000 seems good enough.
-		streams:              make(map[uint32]*clientStream),
+		t: t,
+		conn: &conn{
+			conn:             tconn,
+			tlsState:         &state,
+			remoteAddrStr:    tconn.RemoteAddr().String(),
+			bw:               newBufferedWriter(tconn),
+			streams:          make(map[uint32]*stream),
+			readFrameCh:      make(chan frameAndGate),
+			readFrameErrCh:   make(chan error, 1), // must be buffered for 1
+			wantWriteFrameCh: make(chan frameWriteMsg, 8),
+			wroteFrameCh:     make(chan struct{}, 1), // buffered; one send in reading goroutine
+			bodyReadCh:       make(chan bodyReadMsg), // buffering doesn't matter either way
+			done:             make(chan struct{}),
+			advMaxStreams:    1000, // "infinite", per spec. 1000 seems good enough.
+			writeSched: writeScheduler{
+				maxFrameSize: initialMaxFrameSize, // spec default
+			},
+			initialWindowSize: initialWindowSize, // spec default
+			headerTableSize:   initialHeaderTableSize,
+			pushEnabled:       true,
+			logger:            nil,
+			maxReadFrameSize:  t.maxReadFrameSize(),
+			nextStreamID:      1,
+			isClient:          true,
+			recvGoAwayCh:      make(chan *GoAwayFrame, 1),
+		},
+		connKey: []string{key}, // TODO: cert's validated hostnames too
 	}
-	cc.bw = bufio.NewWriter(stickyErrWriter{tconn, &cc.werr})
-	cc.br = bufio.NewReader(tconn)
-	cc.fr = NewFramer(cc.bw, cc.br)
-	cc.henc = hpack.NewEncoder(&cc.hbuf)
-
-	cc.fr.WriteSettings()
-	// TODO: re-send more conn-level flow control tokens when server uses all these.
-	cc.fr.WriteWindowUpdate(0, 1<<30) // um, 0x7fffffff doesn't work to Google? it hangs?
-	cc.bw.Flush()
-	if cc.werr != nil {
-		return nil, cc.werr
-	}
-
-	// Read the obligatory SETTINGS frame
-	f, err := cc.fr.ReadFrame()
-	if err != nil {
-		return nil, err
-	}
-	sf, ok := f.(*SettingsFrame)
-	if !ok {
-		return nil, fmt.Errorf("expected settings frame, got: %T", f)
-	}
-	cc.fr.WriteSettingsAck()
-	cc.bw.Flush()
-
-	sf.ForeachSetting(func(s Setting) error {
-		switch s.ID {
-		case SettingMaxFrameSize:
-			cc.maxFrameSize = s.Val
-		case SettingMaxConcurrentStreams:
-			cc.maxConcurrentStreams = s.Val
-		case SettingInitialWindowSize:
-			cc.initialWindowSize = s.Val
-		default:
-			// TODO(bradfitz): handle more
-			log.Printf("Unhandled Setting: %v", s)
-		}
-		return nil
-	})
+	// TODO(bgentry): move these to somewhere shared on the conn, probably along
+	// with other conn constructor args above
+	cc.conn.flow.add(initialWindowSize)
+	cc.conn.inflow.add(initialWindowSize)
 	// TODO: figure out henc size
-	cc.hdec = hpack.NewDecoder(initialHeaderTableSize, cc.onNewHeaderField)
+	cc.conn.hpackEncoder = hpack.NewEncoder(&cc.conn.headerWriteBuf)
+	cc.conn.hpackDecoder = hpack.NewDecoder(initialHeaderTableSize, cc.conn.onNewHeaderField)
 
-	go cc.readLoop()
+	fr := NewFramer(cc.conn.bw, tconn)
+	fr.SetMaxReadFrameSize(cc.conn.maxReadFrameSize)
+	cc.conn.framer = fr
+
+	go func() {
+		cc.conn.runG = newGoroutineLock()
+		cc.conn.run()
+	}()
 	return cc, nil
 }
 
-func (cc *clientConn) setGoAway(f *GoAwayFrame) {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-	cc.goAway = f
-}
-
-func (cc *clientConn) canTakeNewRequest() bool {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-	return cc.goAway == nil &&
-		int64(len(cc.streams)+1) < int64(cc.maxConcurrentStreams) &&
-		cc.nextStreamID < 2147483647
-}
-
 func (cc *clientConn) closeIfIdle() {
-	cc.mu.Lock()
-	if len(cc.streams) > 0 {
-		cc.mu.Unlock()
-		return
-	}
-	cc.closed = true
 	// TODO: do clients send GOAWAY too? maybe? Just Close:
-	cc.mu.Unlock()
-
-	cc.tconn.Close()
+	// TODO(bgentry): fix this so it doesn't just always close everything!
+	cc.conn.CloseConn()
 }
 
 func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
-	cc.mu.Lock()
-
-	if cc.closed {
-		cc.mu.Unlock()
-		return nil, errClientConnClosed
+	hasBody := req.Body != nil
+	wrh := &writeReqHeaders{
+		host:      req.Host,
+		method:    req.Method,
+		path:      req.URL.Path,
+		h:         req.Header,
+		endStream: !hasBody,
+		// TODO(bgentry): wrh.contentType, wrh.contentLength
 	}
-
-	cs := cc.newStream()
-	hasBody := false // TODO
-
-	// we send: HEADERS[+CONTINUATION] + (DATA?)
-	hdrs := cc.encodeHeaders(req)
-	first := true
-	for len(hdrs) > 0 {
-		chunk := hdrs
-		if len(chunk) > int(cc.maxFrameSize) {
-			chunk = chunk[:cc.maxFrameSize]
-		}
-		hdrs = hdrs[len(chunk):]
-		endHeaders := len(hdrs) == 0
-		if first {
-			cc.fr.WriteHeaders(HeadersFrameParam{
-				StreamID:      cs.ID,
-				BlockFragment: chunk,
-				EndStream:     !hasBody,
-				EndHeaders:    endHeaders,
-			})
-			first = false
-		} else {
-			cc.fr.WriteContinuation(cs.ID, endHeaders, chunk)
-		}
+	if wrh.host == "" {
+		wrh.host = req.URL.Host
 	}
-	cc.bw.Flush()
-	werr := cc.werr
-	cc.mu.Unlock()
+	if wrh.path == "" {
+		wrh.path = "/"
+	}
+	resc := make(chan resAndError, 1)
+	// TODO(bgentry): recycle ch by tracking them in clientConn / Transport
+	ch := make(chan error, 1)
+	st, err := cc.conn.createStreamFromExternal(wrh, resc, ch)
+	if err != nil {
+		return nil, err
+	}
+	cc.conn.vlogf("created stream %d", st.id)
 
 	if hasBody {
-		// TODO: write data. and it should probably be interleaved:
-		//   go ... io.Copy(dataFrameWriter{cc, cs, ...}, req.Body) ... etc
+		// TODO(bgentry): support requests w/ body
 	}
 
-	if werr != nil {
-		return nil, werr
-	}
-
-	re := <-cs.resc
+	re := <-resc
 	if re.err != nil {
 		return nil, re.err
 	}
 	res := re.res
 	res.Request = req
-	res.TLS = cc.tlsState
 	return res, nil
-}
-
-// requires cc.mu be held.
-func (cc *clientConn) encodeHeaders(req *http.Request) []byte {
-	cc.hbuf.Reset()
-
-	// TODO(bradfitz): figure out :authority-vs-Host stuff between http2 and Go
-	host := req.Host
-	if host == "" {
-		host = req.URL.Host
-	}
-
-	path := req.URL.Path
-	if path == "" {
-		path = "/"
-	}
-
-	cc.writeHeader(":authority", host) // probably not right for all sites
-	cc.writeHeader(":method", req.Method)
-	cc.writeHeader(":path", path)
-	cc.writeHeader(":scheme", "https")
-
-	for k, vv := range req.Header {
-		lowKey := strings.ToLower(k)
-		if lowKey == "host" {
-			continue
-		}
-		for _, v := range vv {
-			cc.writeHeader(lowKey, v)
-		}
-	}
-	return cc.hbuf.Bytes()
-}
-
-func (cc *clientConn) writeHeader(name, value string) {
-	log.Printf("sending %q = %q", name, value)
-	cc.henc.WriteField(hpack.HeaderField{Name: name, Value: value})
 }
 
 type resAndError struct {
 	res *http.Response
 	err error
-}
-
-// requires cc.mu be held.
-func (cc *clientConn) newStream() *clientStream {
-	cs := &clientStream{
-		ID:   cc.nextStreamID,
-		resc: make(chan resAndError, 1),
-	}
-	cc.nextStreamID += 2
-	cc.streams[cs.ID] = cs
-	return cs
-}
-
-func (cc *clientConn) streamByID(id uint32, andRemove bool) *clientStream {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-	cs := cc.streams[id]
-	if andRemove {
-		delete(cc.streams, id)
-	}
-	return cs
-}
-
-// runs in its own goroutine.
-func (cc *clientConn) readLoop() {
-	defer cc.t.removeClientConn(cc)
-	defer close(cc.readerDone)
-
-	activeRes := map[uint32]*clientStream{} // keyed by streamID
-	// Close any response bodies if the server closes prematurely.
-	// TODO: also do this if we've written the headers but not
-	// gotten a response yet.
-	defer func() {
-		err := cc.readerErr
-		if err == io.EOF {
-			err = io.ErrUnexpectedEOF
-		}
-		for _, cs := range activeRes {
-			cs.pw.CloseWithError(err)
-		}
-	}()
-
-	// continueStreamID is the stream ID we're waiting for
-	// continuation frames for.
-	var continueStreamID uint32
-
-	for {
-		f, err := cc.fr.ReadFrame()
-		if err != nil {
-			cc.readerErr = err
-			return
-		}
-		log.Printf("Transport received %v: %#v", f.Header(), f)
-
-		streamID := f.Header().StreamID
-
-		_, isContinue := f.(*ContinuationFrame)
-		if isContinue {
-			if streamID != continueStreamID {
-				log.Printf("Protocol violation: got CONTINUATION with id %d; want %d", streamID, continueStreamID)
-				cc.readerErr = ConnectionError(ErrCodeProtocol)
-				return
-			}
-		} else if continueStreamID != 0 {
-			// Continue frames need to be adjacent in the stream
-			// and we were in the middle of headers.
-			log.Printf("Protocol violation: got %T for stream %d, want CONTINUATION for %d", f, streamID, continueStreamID)
-			cc.readerErr = ConnectionError(ErrCodeProtocol)
-			return
-		}
-
-		if streamID%2 == 0 {
-			// Ignore streams pushed from the server for now.
-			// These always have an even stream id.
-			continue
-		}
-		streamEnded := false
-		if ff, ok := f.(streamEnder); ok {
-			streamEnded = ff.StreamEnded()
-		}
-
-		cs := cc.streamByID(streamID, streamEnded)
-		if cs == nil {
-			log.Printf("Received frame for untracked stream ID %d", streamID)
-			continue
-		}
-
-		switch f := f.(type) {
-		case *HeadersFrame:
-			cc.nextRes = &http.Response{
-				Proto:      "HTTP/2.0",
-				ProtoMajor: 2,
-				Header:     make(http.Header),
-			}
-			cs.pr, cs.pw = io.Pipe()
-			cc.hdec.Write(f.HeaderBlockFragment())
-		case *ContinuationFrame:
-			cc.hdec.Write(f.HeaderBlockFragment())
-		case *DataFrame:
-			log.Printf("DATA: %q", f.Data())
-			cs.pw.Write(f.Data())
-		case *GoAwayFrame:
-			cc.t.removeClientConn(cc)
-			if f.ErrCode != 0 {
-				// TODO: deal with GOAWAY more. particularly the error code
-				log.Printf("transport got GOAWAY with error code = %v", f.ErrCode)
-			}
-			cc.setGoAway(f)
-		default:
-			log.Printf("Transport: unhandled response frame type %T", f)
-		}
-		headersEnded := false
-		if he, ok := f.(headersEnder); ok {
-			headersEnded = he.HeadersEnded()
-			if headersEnded {
-				continueStreamID = 0
-			} else {
-				continueStreamID = streamID
-			}
-		}
-
-		if streamEnded {
-			cs.pw.Close()
-			delete(activeRes, streamID)
-		}
-		if headersEnded {
-			if cs == nil {
-				panic("couldn't find stream") // TODO be graceful
-			}
-			// TODO: set the Body to one which notes the
-			// Close and also sends the server a
-			// RST_STREAM
-			cc.nextRes.Body = cs.pr
-			res := cc.nextRes
-			activeRes[streamID] = cs
-			cs.resc <- resAndError{res: res}
-		}
-	}
-}
-
-func (cc *clientConn) onNewHeaderField(f hpack.HeaderField) {
-	// TODO: verifiy pseudo headers come before non-pseudo headers
-	// TODO: verifiy the status is set
-	log.Printf("Header field: %+v", f)
-	if f.Name == ":status" {
-		code, err := strconv.Atoi(f.Value)
-		if err != nil {
-			panic("TODO: be graceful")
-		}
-		cc.nextRes.Status = f.Value + " " + http.StatusText(code)
-		cc.nextRes.StatusCode = code
-		return
-	}
-	if strings.HasPrefix(f.Name, ":") {
-		// "Endpoints MUST NOT generate pseudo-header fields other than those defined in this document."
-		// TODO: treat as invalid?
-		return
-	}
-	cc.nextRes.Header.Add(http.CanonicalHeaderKey(f.Name), f.Value)
 }

@@ -214,6 +214,7 @@ func (srv *Server) handleConn(hs *http.Server, c net.Conn, h http.Handler) {
 			pushEnabled:       true,
 			logger:            hs.ErrorLog,
 			maxReadFrameSize:  srv.maxReadFrameSize(),
+			isClient:          false,
 		},
 	}
 	sc.conn.onRequest = sc.runHandler // TODO(bgentry): remove this, untangle it
@@ -310,7 +311,7 @@ func (sc *serverConn) rejectConn(err ErrCode, debug string) {
 	// ignoring errors. hanging up anyway.
 	sc.conn.framer.WriteGoAway(0, err, []byte(debug))
 	sc.conn.bw.Flush()
-	sc.conn.conn.Close()
+	sc.conn.CloseConn()
 }
 
 // frameAndGates coordinates the readFrames and serve
@@ -328,31 +329,6 @@ type serverConn struct {
 	conn    *conn
 	srv     *Server
 	handler http.Handler
-}
-
-// stream represents a stream. This is the minimal metadata needed by
-// the serve goroutine. Most of the actual stream state is owned by
-// the http.Handler's goroutine in the responseWriter. Because the
-// responseWriter's responseWriterState is recycled at the end of a
-// handler, this struct intentionally has no pointer to the
-// *responseWriter{,State} itself, as the Handler ending nils out the
-// responseWriter's state field.
-type stream struct {
-	// immutable:
-	id   uint32
-	body *pipe       // non-nil if expecting DATA frames
-	cw   closeWaiter // closed wait stream transitions to closed state
-
-	// owned by serverConn's serve loop:
-	bodyBytes     int64   // body bytes seen so far
-	declBodyBytes int64   // or -1 if undeclared
-	flow          flow    // limits writing from Handler to client
-	inflow        flow    // what the client is allowed to POST/etc to us
-	parent        *stream // or nil
-	weight        uint8
-	state         streamState
-	sentReset     bool // only true once detached from streams map
-	gotReset      bool // only true once detacted from streams map
 }
 
 // Run on its own goroutine.
@@ -458,7 +434,7 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 			ctype = http.DetectContentType(p)
 		}
 		endStream := rws.handlerDone && len(p) == 0
-		rws.conn.writeHeaders(rws.stream, &writeResHeaders{
+		rws.conn.writeHeadersFromExternal(rws.stream, &writeResHeaders{
 			streamID:      rws.stream.id,
 			httpResCode:   rws.status,
 			h:             rws.snapHeader,
