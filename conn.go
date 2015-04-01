@@ -1199,7 +1199,7 @@ func (c *conn) processHeaderBlockFragment(st *stream, frag []byte, end bool) err
 		if st.resc != nil {
 			st.resc <- resAndError{res, err}
 		}
-		st.body = res.Body.(*requestBody).pipe // may be nil
+		st.body = res.Body.(*msgBody).pipe // may be nil
 		st.declBodyBytes = res.ContentLength
 		return err
 	}
@@ -1208,7 +1208,7 @@ func (c *conn) processHeaderBlockFragment(st *stream, frag []byte, end bool) err
 	if err != nil {
 		return err
 	}
-	st.body = req.Body.(*requestBody).pipe // may be nil
+	st.body = req.Body.(*msgBody).pipe // may be nil
 	st.declBodyBytes = req.ContentLength
 	go c.onRequest(rw, req)
 	return nil
@@ -1275,7 +1275,7 @@ func (c *conn) newResponse() (*http.Response, error) {
 	}
 	state := rp.stream.state
 	bodyOpen := (state == stateOpen || state == stateHalfClosedLocal)
-	body := &requestBody{
+	body := &msgBody{
 		conn:   c,
 		stream: rp.stream,
 	}
@@ -1332,7 +1332,7 @@ func (c *conn) newWriterAndRequest() (*responseWriter, *http.Request, error) {
 		rp.header.Del("Expect")
 	}
 	bodyOpen := rp.stream.state == stateOpen
-	body := &requestBody{
+	body := &msgBody{
 		conn:          c,
 		stream:        rp.stream,
 		needsContinue: needsContinue,
@@ -1443,4 +1443,35 @@ func (c *conn) sendWindowUpdate32(st *stream, n int32) {
 	if !ok {
 		panic("internal error; sent too many window updates without decrements?")
 	}
+}
+
+type msgBody struct {
+	stream        *stream
+	conn          *conn
+	closed        bool
+	pipe          *pipe // non-nil if we have a HTTP entity message body
+	needsContinue bool  // need to send a 100-continue (only use for responses)
+}
+
+func (b *msgBody) Close() error {
+	if b.pipe != nil {
+		b.pipe.Close(errClosedBody)
+	}
+	b.closed = true
+	return nil
+}
+
+func (b *msgBody) Read(p []byte) (n int, err error) {
+	if b.needsContinue {
+		b.needsContinue = false
+		b.conn.write100ContinueHeaders(b.stream)
+	}
+	if b.pipe == nil {
+		return 0, io.EOF
+	}
+	n, err = b.pipe.Read(p)
+	if n > 0 {
+		b.conn.noteBodyReadFromExternal(b.stream, n)
+	}
+	return
 }

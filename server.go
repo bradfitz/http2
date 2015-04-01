@@ -44,7 +44,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -338,37 +337,6 @@ func (sc *serverConn) runHandler(rw *responseWriter, req *http.Request) {
 	sc.handler.ServeHTTP(rw, req)
 }
 
-type requestBody struct {
-	stream        *stream
-	conn          *conn
-	closed        bool
-	pipe          *pipe // non-nil if we have a HTTP entity message body
-	needsContinue bool  // need to send a 100-continue
-}
-
-func (b *requestBody) Close() error {
-	if b.pipe != nil {
-		b.pipe.Close(errClosedBody)
-	}
-	b.closed = true
-	return nil
-}
-
-func (b *requestBody) Read(p []byte) (n int, err error) {
-	if b.needsContinue {
-		b.needsContinue = false
-		b.conn.write100ContinueHeaders(b.stream)
-	}
-	if b.pipe == nil {
-		return 0, io.EOF
-	}
-	n, err = b.pipe.Read(p)
-	if n > 0 {
-		b.conn.noteBodyReadFromExternal(b.stream, n)
-	}
-	return
-}
-
 // responseWriter is the http.ResponseWriter implementation.  It's
 // intentionally small (1 pointer wide) to minimize garbage.  The
 // responseWriterState pointer inside is zeroed at the end of a
@@ -390,7 +358,7 @@ type responseWriterState struct {
 	// immutable within a request:
 	stream *stream
 	req    *http.Request
-	body   *requestBody // to close at end of request, if DATA frames didn't
+	body   *msgBody // to close at end of request, if DATA frames didn't
 	conn   *conn
 
 	// TODO: adjust buffer writing sizes based on server config, frame size updates from peer, etc
