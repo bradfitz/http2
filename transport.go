@@ -339,6 +339,9 @@ func (t *Transport) findOrCreateConnectingSession(req *http.Request, sk sessionK
       cs, err := t.createSessionForKey(sk)
       t.sessMu.Lock()
       defer t.sessMu.Unlock()
+      if err == nil {
+        t.availableSessions[sk] = cs
+      }
       for sreq, _ := range t.sessionRequests[sk] {
         if err != nil {
           sreq.errCh<- err
@@ -350,9 +353,6 @@ func (t *Transport) findOrCreateConnectingSession(req *http.Request, sk sessionK
   }
   select {
   case cs := <-sr.csCh:
-    t.sessMu.Lock()
-    defer t.sessMu.Unlock()
-    t.availableSessions[sk] = cs
     return cs, nil
   case err := <-sr.errCh:
     return nil, err

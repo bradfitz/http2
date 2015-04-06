@@ -17,7 +17,7 @@ tr := http2.Transport{
     return url.Parse("https://myproxy.com"), nil
   },
 
-  // Use standart client if connection fails
+  // Use standard client if connection fails
   Fallback: http.DefaultTransport,
 
   // Override tls config
