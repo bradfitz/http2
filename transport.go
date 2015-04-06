@@ -36,7 +36,7 @@ type Transport struct {
   MaxConcurrentStreams uint32
   MaxReadFrameSize uint32
   PushHandler func(p PushPromise)
-  Fallback *http.Transport
+  Fallback http.RoundTripper
 }
 
 type PushPromise struct {
