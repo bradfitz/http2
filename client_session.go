@@ -31,8 +31,8 @@ type clientSession struct {
   framer *Framer
   hpackDecoder *hpack.Decoder
 
-  streams map[uint32]*clientH2Stream
-  createdStreams map[*stream]*clientH2Stream
+  streams map[uint32]*clientStream
+  createdStreams map[*stream]*clientStream
 
   headerWriteBuf bytes.Buffer
   hpackEncoder *hpack.Encoder
@@ -86,7 +86,7 @@ type clientSession struct {
 
 type streamRequest struct {
   errCh chan error
-  stCh chan *clientH2Stream
+  stCh chan *clientStream
 
   // TODO: use atomic?
   cmu sync.Mutex
@@ -95,7 +95,7 @@ type streamRequest struct {
 
 type cancelMsg struct {
   done chan error
-  st *clientH2Stream
+  st *clientStream
 }
 
 type availablilityState uint8
@@ -125,7 +125,7 @@ func (sr *streamRequest) cancelled() bool {
 }
 
 type headersParam struct {
-  stream* clientH2Stream
+  stream* clientStream
   header http.Header
   status string
   method string
@@ -152,8 +152,8 @@ func newClientSession(t *Transport, tconn *tls.Conn,
     t: t,
     tconn: tconn,
     tlsState: state,
-    streams: make(map[uint32]*clientH2Stream),
-    createdStreams: make(map[*stream]*clientH2Stream),
+    streams: make(map[uint32]*clientStream),
+    createdStreams: make(map[*stream]*clientStream),
     nextStreamID: 1,
     initialWindowSize: initialWindowSize,
     writeSched: writeScheduler{
@@ -195,9 +195,9 @@ func newClientSession(t *Transport, tconn *tls.Conn,
   return cs
 }
 
-func (cs *clientSession) createStream(req *http.Request) (*clientH2Stream, error) {
+func (cs *clientSession) createStream(req *http.Request) (*clientStream, error) {
   errCh := make(chan error)
-  stCh := make(chan *clientH2Stream)
+  stCh := make(chan *clientStream)
   sr := &streamRequest{ errCh: errCh, stCh: stCh }
   // TODO ugly.
   cs.t.setReqCanceler(req, func() { sr.cancel() })
@@ -210,7 +210,7 @@ func (cs *clientSession) createStream(req *http.Request) (*clientH2Stream, error
   }
 }
 
-func (cs *clientSession) writeHeaders(st *clientH2Stream, headerData *writeReqHeaders, tempCh chan error) error {
+func (cs *clientSession) writeHeaders(st *clientStream, headerData *writeReqHeaders, tempCh chan error) error {
   cs.serveG.checkNotOn() // NOT on
   var errc chan error
   if headerData.h != nil {
@@ -233,7 +233,7 @@ func (cs *clientSession) writeHeaders(st *clientH2Stream, headerData *writeReqHe
   return nil
 }
 
-func (cs *clientSession) writeData(st *clientH2Stream, writeData *writeData, ch chan error) error {
+func (cs *clientSession) writeData(st *clientStream, writeData *writeData, ch chan error) error {
   cs.writeFrameFromClient(frameWriteMsg{
     write:  writeData,
     stream: st.stream,
@@ -409,7 +409,7 @@ func (cs *clientSession) drainSession(errCode ErrCode) {
   }
 }
 
-func (cs *clientSession) createClientStream(isPush bool, id uint32) *clientH2Stream {
+func (cs *clientSession) createClientStream(isPush bool, id uint32) *clientStream {
   st := &stream{
     id: id,
     state: stateOpen,
@@ -421,7 +421,7 @@ func (cs *clientSession) createClientStream(isPush bool, id uint32) *clientH2Str
   st.inflow.conn = &cs.inflow
   st.inflow.add(initialWindowSize)
 
-  cst := &clientH2Stream{
+  cst := &clientStream{
     stream: st,
     session: cs,
     respCh: make(chan interface{}, 10),
@@ -830,7 +830,7 @@ func (cs *clientSession) processContinuation(f *ContinuationFrame) error {
   return cs.processHeaderBlockFragment(st, f.HeaderBlockFragment(), f.HeadersEnded())
 }
 
-func (cs *clientSession) processHeaderBlockFragment(st *clientH2Stream, frag []byte, end bool) error {
+func (cs *clientSession) processHeaderBlockFragment(st *clientStream, frag []byte, end bool) error {
   cs.serveG.check()
   if _, err := cs.hpackDecoder.Write(frag); err != nil {
     // TODO: convert to stream error I assume?
@@ -851,7 +851,7 @@ func (cs *clientSession) processHeaderBlockFragment(st *clientH2Stream, frag []b
   }
 }
 
-func (cs *clientSession) processResponseHeaders(st *clientH2Stream) error {
+func (cs *clientSession) processResponseHeaders(st *clientStream) error {
   cs.serveG.check()
   res, err := cs.newResponse()
   if err != nil {
@@ -867,7 +867,7 @@ func (cs *clientSession) processResponseHeaders(st *clientH2Stream) error {
   return nil
 }
 
-func (cs *clientSession) processPushHeaders(st *clientH2Stream) error {
+func (cs *clientSession) processPushHeaders(st *clientStream) error {
   cs.serveG.check()
   if !cs.pushEnabled {
     return StreamError{st.id, ErrCodeRefusedStream}
@@ -1155,16 +1155,16 @@ func (cs *clientSession) goAway(code ErrCode) {
 }
 
 type clientBodyReadMsg struct {
-  st *clientH2Stream
+  st *clientStream
   n  int
 }
 
-func (cs *clientSession) noteBodyReadFromClient(st *clientH2Stream, n int) {
+func (cs *clientSession) noteBodyReadFromClient(st *clientStream, n int) {
   cs.serveG.checkNotOn() // NOT on
   cs.bodyReadCh <- clientBodyReadMsg{st, n}
 }
 
-func (cs *clientSession) noteBodyRead(st *clientH2Stream, n int) {
+func (cs *clientSession) noteBodyRead(st *clientStream, n int) {
   cs.serveG.check()
   cs.sendWindowUpdate(nil, n) // conn-level
   if st.state != stateHalfClosedRemote && st.state != stateClosed {
@@ -1218,7 +1218,7 @@ func (cs *clientSession) sendWindowUpdate32(st *stream, n int32) {
   }
 }
 
-func (cs *clientSession) closeClientStream(st *clientH2Stream, err error) {
+func (cs *clientSession) closeClientStream(st *clientStream, err error) {
   st.respCh<- errMsg{err: err}
   cs.closeStream(st.stream, err)
 }
@@ -1305,7 +1305,7 @@ func (cs *clientSession) close() {
   cs.wantCloseCh<- struct{}{}
 }
 
-func (cs *clientSession) state(streamID uint32) (streamState, *clientH2Stream) {
+func (cs *clientSession) state(streamID uint32) (streamState, *clientStream) {
   cs.serveG.check()
   // http://http2.github.io/http2-spec/#rfc.section.5.1
   if st, ok := cs.streams[streamID]; ok {

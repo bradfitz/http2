@@ -42,7 +42,7 @@ type Transport struct {
 type PushPromise struct {
   Request *http.Request
   Associated *http.Request
-  st *clientH2Stream
+  st *clientStream
 }
 
 func (p *PushPromise) Resolve(nextHandler func(p PushPromise)) (*http.Response, error) {
@@ -196,7 +196,7 @@ func (t *Transport) sessionKeyForRequest(req *http.Request) (sessionKey, error) 
 type roundTripper struct {
   t *Transport
   req *http.Request
-  stream *clientH2Stream
+  stream *clientStream
 }
 
 type gzipReader struct {

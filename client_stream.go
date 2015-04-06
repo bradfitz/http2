@@ -7,7 +7,7 @@ import (
   "sync"
 )
 
-type clientH2Stream struct {
+type clientStream struct {
   *stream
   req *http.Request
   session *clientSession
@@ -35,11 +35,11 @@ type errMsg struct {
 }
 
 type pushMsg struct {
-  st *clientH2Stream
+  st *clientStream
   req *http.Request
 }
 
-func (st *clientH2Stream) start(pushHandler func(p PushPromise)) {
+func (st *clientStream) start(pushHandler func(p PushPromise)) {
   st.bb = newBodyBuffer()
   st.bb.st = st
   // Kick off response body read coroutine immediately.
@@ -73,7 +73,7 @@ func (st *clientH2Stream) start(pushHandler func(p PushPromise)) {
   }(st.bb, pushHandler)
 }
 
-func (st *clientH2Stream) writeHeaders(req *http.Request) error {
+func (st *clientStream) writeHeaders(req *http.Request) error {
   st.req = req
   done := make(chan error, 1)
   hasBody := req.Body != nil
@@ -87,7 +87,7 @@ func (st *clientH2Stream) writeHeaders(req *http.Request) error {
   }, done)
 }
 
-func (st *clientH2Stream) endRequest() error {
+func (st *clientStream) endRequest() error {
   done := make(chan error, 1)
   return st.session.writeData(st, &writeData{
     streamID: st.id,
@@ -96,7 +96,7 @@ func (st *clientH2Stream) endRequest() error {
   }, done)
 }
 
-func (st *clientH2Stream) readResponse() (*http.Response, error) {
+func (st *clientStream) readResponse() (*http.Response, error) {
   if st.streamError != nil {
     return nil, st.streamError
   }
@@ -119,11 +119,11 @@ func (st *clientH2Stream) readResponse() (*http.Response, error) {
   return resp, nil
 }
 
-func (st *clientH2Stream) noteBodyRead(n int) {
+func (st *clientStream) noteBodyRead(n int) {
   st.session.noteBodyReadFromClient(st, n)
 }
 
-func (st *clientH2Stream) cancel() error {
+func (st *clientStream) cancel() error {
   done := make(chan error, 1)
   st.session.cancelCh<- cancelMsg{st: st, done: done}
   err := <-done
@@ -135,7 +135,7 @@ type bodyBuffer struct {
   cond *sync.Cond
   data *list.List
   bodyErr error
-  st *clientH2Stream
+  st *clientStream
 }
 
 func newBodyBuffer() *bodyBuffer {
@@ -192,7 +192,7 @@ func (bb *bodyBuffer) closeWithError(err error) {
 }
 
 type reqBodyWriter struct {
-  st *clientH2Stream
+  st *clientStream
 }
 
 func (rw *reqBodyWriter) Write(b []byte) (int, error) {
