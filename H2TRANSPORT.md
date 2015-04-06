@@ -48,9 +48,7 @@ tr := http2.Transport{
     } else if p.Associated.URL.Host != "mypushinghost" {
       p.Cancel()
     } else {
-      // nil means that pushes associated with that push stream will be rejected.
-      // Pass same func here to handle nested pushes.
-      res, err := p.Resolve(nil)
+      res, err := p.Resolve()
     }
   },
 }

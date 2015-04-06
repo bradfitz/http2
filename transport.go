@@ -45,7 +45,7 @@ type PushPromise struct {
   st *clientStream
 }
 
-func (p *PushPromise) Resolve(nextHandler func(p PushPromise)) (*http.Response, error) {
+func (p *PushPromise) Resolve() (*http.Response, error) {
   resp, err := p.st.readResponse()
   if err == nil {
     resp = prepareResponse(resp)
