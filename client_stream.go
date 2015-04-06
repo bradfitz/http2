@@ -74,6 +74,7 @@ func (st *clientH2Stream) start(pushHandler func(p PushPromise)) {
 }
 
 func (st *clientH2Stream) writeHeaders(req *http.Request) error {
+  st.req = req
   done := make(chan error, 1)
   hasBody := req.Body != nil
   return st.session.writeHeaders(st, &writeReqHeaders{
@@ -109,11 +110,11 @@ func (st *clientH2Stream) readResponse() (*http.Response, error) {
   }
 
   resp := st.respData.resp
+  resp.Request = st.req
+  resp.TLS = st.session.tlsState
 
   if !st.respData.streamEnded {
-    resp.Request = st.req
     resp.Body = st.bb
-    resp.TLS = st.session.tlsState
   }
   return resp, nil
 }

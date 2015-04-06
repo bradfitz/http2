@@ -21,7 +21,7 @@ const (
 )
 
 type clientSession struct {
-  t *YaTransport
+  t *Transport
   tconn *tls.Conn
   tlsState *tls.ConnectionState
   bw *bufferedWriter
@@ -144,7 +144,7 @@ func (cs *clientSession) HeaderEncoder() (*hpack.Encoder, *bytes.Buffer) {
   return cs.hpackEncoder, &cs.headerWriteBuf
 }
 
-func newClientSession(t *YaTransport, tconn *tls.Conn,
+func newClientSession(t *Transport, tconn *tls.Conn,
                       state *tls.ConnectionState, initialWindowSize int32,
                       initialMaxFrameSize uint32, initialHeaderTableSize uint32,
                       pushEnabled bool) *clientSession {
@@ -313,6 +313,9 @@ func (cs *clientSession) mainLoop() {
     case m := <-cs.bodyReadCh:
       cs.noteBodyRead(m.st, m.n)
     case <-cs.wantCloseCh:
+      if len(cs.streams) != 0 {
+        panic("closing not idle session!")
+      }
       cs.goAway(ErrCodeNo)
     case <-settingsTimer.C:
       cs.logf("timeout waiting for SETTINGS frames from %v", cs.tconn.RemoteAddr())
@@ -1037,7 +1040,8 @@ func (cs *clientSession) startFrameWrite(wm frameWriteMsg) {
     case stateOpen:
       st.state = stateHalfClosedLocal
     case stateHalfClosedRemote:
-      cs.closeStream(st, nil)
+      clSt := cs.streams[st.id]
+      cs.closeClientStream(clSt, nil)
     }
   }
   go cs.writeFrameAsync(wm)
@@ -1261,7 +1265,7 @@ func (cs *clientSession) shutDownIn(d time.Duration) {
 func (cs *clientSession) closeAllStreamsOnConnClose() {
   cs.serveG.check()
   for _, st := range cs.streams {
-    cs.closeStream(st.stream, errClientDisconnected)
+    cs.closeClientStream(st, errClientDisconnected)
   }
 }
 
