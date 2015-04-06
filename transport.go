@@ -15,6 +15,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,6 +25,8 @@ import (
 
 type Transport struct {
 	Fallback http.RoundTripper
+
+	Proxy	func(*http.Request) (*url.URL, error)
 
 	// TODO: remove this and make more general with a TLS dial hook, like http
 	InsecureTLSDial bool
@@ -82,16 +85,27 @@ func (sew stickyErrWriter) Write(p []byte) (n int, err error) {
 }
 
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Scheme != "https" {
+	var endpoint *url.URL
+	if t.Proxy != nil {
+		if proxyUrl, err := t.Proxy(req); err != nil {
+			endpoint = req.URL
+		} else {
+			endpoint = proxyUrl
+		}
+	} else {
+		endpoint = req.URL
+	}
+
+	if endpoint.Scheme != "https" {
 		if t.Fallback == nil {
 			return nil, errors.New("http2: unsupported scheme and no Fallback")
 		}
 		return t.Fallback.RoundTrip(req)
 	}
 
-	host, port, err := net.SplitHostPort(req.URL.Host)
+	host, port, err := net.SplitHostPort(endpoint.Host)
 	if err != nil {
-		host = req.URL.Host
+		host = endpoint.Host
 		port = "443"
 	}
 
@@ -369,7 +383,7 @@ func (cc *clientConn) encodeHeaders(req *http.Request) []byte {
 	cc.writeHeader(":authority", host) // probably not right for all sites
 	cc.writeHeader(":method", req.Method)
 	cc.writeHeader(":path", path)
-	cc.writeHeader(":scheme", "https")
+	cc.writeHeader(":scheme", req.URL.Scheme)
 
 	for k, vv := range req.Header {
 		lowKey := strings.ToLower(k)
@@ -499,6 +513,9 @@ func (cc *clientConn) readLoop() {
 				log.Printf("transport got GOAWAY with error code = %v", f.ErrCode)
 			}
 			cc.setGoAway(f)
+		case *PushPromiseFrame:
+			log.Printf("Push promises not supported yet")
+			continue
 		default:
 			log.Printf("Transport: unhandled response frame type %T", f)
 		}
