@@ -215,6 +215,7 @@ func (srv *Server) handleConn(hs *http.Server, c net.Conn, h http.Handler) {
 		headerTableSize:   initialHeaderTableSize,
 		serveG:            newGoroutineLock(),
 		pushEnabled:       true,
+		roots:             newRoots(),
 	}
 	sc.flow.add(initialWindowSize)
 	sc.inflow.add(initialWindowSize)
@@ -364,6 +365,7 @@ type serverConn struct {
 	goAwayCode            ErrCode
 	shutdownTimerCh       <-chan time.Time // nil until used
 	shutdownTimer         *time.Timer      // nil until used
+	roots                 *roots           // roots streams
 
 	// Owned by the writeFrameAsync goroutine:
 	headerWriteBuf bytes.Buffer
@@ -382,31 +384,6 @@ type requestParam struct {
 	scheme, authority string
 	sawRegularHeader  bool // saw a non-pseudo header already
 	invalidHeader     bool // an invalid header was seen
-}
-
-// stream represents a stream. This is the minimal metadata needed by
-// the serve goroutine. Most of the actual stream state is owned by
-// the http.Handler's goroutine in the responseWriter. Because the
-// responseWriter's responseWriterState is recycled at the end of a
-// handler, this struct intentionally has no pointer to the
-// *responseWriter{,State} itself, as the Handler ending nils out the
-// responseWriter's state field.
-type stream struct {
-	// immutable:
-	id   uint32
-	body *pipe       // non-nil if expecting DATA frames
-	cw   closeWaiter // closed wait stream transitions to closed state
-
-	// owned by serverConn's serve loop:
-	bodyBytes     int64   // body bytes seen so far
-	declBodyBytes int64   // or -1 if undeclared
-	flow          flow    // limits writing from Handler to client
-	inflow        flow    // what the client is allowed to POST/etc to us
-	parent        *stream // or nil
-	weight        uint8
-	state         streamState
-	sentReset     bool // only true once detached from streams map
-	gotReset      bool // only true once detacted from streams map
 }
 
 func (sc *serverConn) Framer() *Framer  { return sc.framer }
@@ -1055,9 +1032,13 @@ func (sc *serverConn) closeStream(st *stream, err error) {
 	if st.state == stateIdle || st.state == stateClosed {
 		panic(fmt.Sprintf("invariant; can't close stream in state %v", st.state))
 	}
+
 	st.state = stateClosed
 	sc.curOpenStreams--
-	delete(sc.streams, st.id)
+	if s, ok := sc.streams[st.id]; ok {
+		delete(sc.streams, st.id)
+		s.closeStream()
+	}
 	if p := st.body; p != nil {
 		p.Close(err)
 	}
@@ -1214,23 +1195,23 @@ func (sc *serverConn) processHeaders(f *HeadersFrame) error {
 	if id > sc.maxStreamID {
 		sc.maxStreamID = id
 	}
-	st := &stream{
-		id:    id,
-		state: stateOpen,
-	}
-	if f.StreamEnded() {
-		st.state = stateHalfClosedRemote
-	}
-	st.cw.Init()
 
-	st.flow.conn = &sc.flow // link to conn-level counter
-	st.flow.add(sc.initialWindowSize)
-	st.inflow.conn = &sc.inflow      // link to conn-level counter
-	st.inflow.add(initialWindowSize) // TODO: update this when we send a higher initial window size in the initial settings
-
-	sc.streams[id] = st
+	st := newStream(id, sc.roots, sc.streams)
+	var err error
 	if f.HasPriority() {
-		adjustStreamPriority(sc.streams, st.id, f.Priority)
+		err = st.createStreamPriority(f.Priority)
+	} else {
+		err = st.createStreamPriority(defaultPriority)
+	}
+	if err != nil {
+		return err
+	}
+
+	st.setupFlow(sc)
+	if f.StreamEnded() {
+		st.setState(stateHalfClosedRemote)
+	} else {
+		st.setState(stateOpen)
 	}
 	sc.curOpenStreams++
 	sc.req = requestParam{
@@ -1293,8 +1274,14 @@ func (sc *serverConn) processHeaderBlockFragment(st *stream, frag []byte, end bo
 }
 
 func (sc *serverConn) processPriority(f *PriorityFrame) error {
-	adjustStreamPriority(sc.streams, f.StreamID, f.PriorityParam)
-	return nil
+	st, ok := sc.streams[f.StreamID]
+	if !ok {
+		// TODO (brk0v): not quite correct (this streamID might
+		// already exist in the dep tree, but be closed), but
+		// close enough for now.
+		return nil
+	}
+	return st.adjustStreamPriority(f.PriorityParam)
 }
 
 func adjustStreamPriority(streams map[uint32]*stream, streamID uint32, priority PriorityParam) {
