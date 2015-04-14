@@ -25,6 +25,15 @@ import (
 type Transport struct {
 	Fallback http.RoundTripper
 
+	// DialTLS specifies an optional dial function for creating
+	// TLS connections for non-proxied HTTPS requests.
+	//
+	// If DialTLS is nil, net.Dial and the default tls.Config are used.
+	//
+	// The returned net.Conn is assumed to already be
+	// past the TLS handshake.
+	DialTLS func(network, addr string) (net.Conn, error)
+
 	// TODO: remove this and make more general with a TLS dial hook, like http
 	InsecureTLSDial bool
 
@@ -186,18 +195,30 @@ func (t *Transport) newClientConn(host, port, key string) (*clientConn, error) {
 		NextProtos:         []string{NextProtoTLS},
 		InsecureSkipVerify: t.InsecureTLSDial,
 	}
-	tconn, err := tls.Dial("tcp", host+":"+port, cfg)
-	if err != nil {
-		return nil, err
-	}
-	if err := tconn.Handshake(); err != nil {
-		return nil, err
-	}
-	if !t.InsecureTLSDial {
-		if err := tconn.VerifyHostname(cfg.ServerName); err != nil {
+	addr := host + ":" + port
+	var tconn *tls.Conn
+	if t.DialTLS != nil {
+		conn, err := t.DialTLS("tcp", addr)
+		if err != nil {
 			return nil, err
 		}
+		tconn = conn.(*tls.Conn)
+	} else {
+		var err error
+		tconn, err = tls.Dial("tcp", addr, cfg)
+		if err != nil {
+			return nil, err
+		}
+		if err := tconn.Handshake(); err != nil {
+			return nil, err
+		}
+		if !t.InsecureTLSDial {
+			if err := tconn.VerifyHostname(cfg.ServerName); err != nil {
+				return nil, err
+			}
+		}
 	}
+
 	state := tconn.ConnectionState()
 	if p := state.NegotiatedProtocol; p != NextProtoTLS {
 		// TODO(bradfitz): fall back to Fallback
