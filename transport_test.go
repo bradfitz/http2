@@ -6,6 +6,7 @@
 package http2
 
 import (
+	"bytes"
 	"flag"
 	"io"
 	"io/ioutil"
@@ -121,6 +122,58 @@ func TestTransportReusesConns(t *testing.T) {
 	}
 }
 
+func TestTransportPostBody(t *testing.T) {
+	const responseBody = `response ok`
+	const requestBody = `a not so very long request body`
+
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		body, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := string(body); requestBody != got {
+			t.Errorf("want request body %q, got %q", requestBody, got)
+		}
+		io.WriteString(w, responseBody)
+	})
+	defer st.Close()
+
+	tr := &Transport{InsecureTLSDial: true}
+	defer tr.CloseIdleConnections()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		req, err := http.NewRequest("POST", st.ts.URL, bytes.NewBufferString(requestBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := tr.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+
+		if g, w := res.StatusCode, 200; g != w {
+			t.Errorf("StatusCode = %v; want %v", g, w)
+		}
+		slurp, err := ioutil.ReadAll(res.Body)
+		if err != nil {
+			t.Error("response body read: %v", err)
+		} else if string(slurp) != responseBody {
+			t.Errorf("response body = %q; want %q", slurp, responseBody)
+		}
+	}()
+
+	// deadlock? that's a bug.
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout")
+	}
+}
+
 func TestTransportAbortClosesPipes(t *testing.T) {
 	shutdown := make(chan struct{})
 	st := newServerTester(t,
@@ -159,6 +212,66 @@ func TestTransportAbortClosesPipes(t *testing.T) {
 	<-requestMade
 	// Now force the serve loop to end, via closing the connection.
 	st.closeConn()
+	// deadlock? that's a bug.
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout")
+	}
+}
+
+func TestTransport_LargeBodies_FlowControlled(t *testing.T) {
+	shutdown := make(chan struct{})
+	const size = 10*initialWindowSize + 1
+	requestBody := bytes.Repeat([]byte("a"), size)
+	responseBody := bytes.Repeat([]byte("b"), size)
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		slurp, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		} else if string(slurp) != string(requestBody) {
+			t.Errorf("request body len=%d; want %d", len(slurp), len(requestBody))
+		}
+
+		doneWriting := make(chan struct{})
+		go func() {
+			defer close(doneWriting)
+			if _, err := w.Write(responseBody); err != nil {
+				t.Fatal(err)
+			}
+		}()
+		select {
+		case <-doneWriting:
+		case <-shutdown:
+		}
+	})
+	defer st.Close()
+	defer close(shutdown) // we must shutdown before st.Close() to avoid hanging
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		tr := &Transport{
+			InsecureTLSDial: true,
+		}
+		reqBody := bytes.NewReader(requestBody)
+		req, err := http.NewRequest("GET", st.ts.URL, reqBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := tr.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		slurp, err := ioutil.ReadAll(res.Body)
+		if err != nil {
+			t.Fatal(err)
+		} else if string(slurp) != string(responseBody) {
+			t.Errorf("response body len=%d; want %d", len(slurp), len(responseBody))
+		}
+	}()
+
 	// deadlock? that's a bug.
 	select {
 	case <-done:

@@ -99,10 +99,94 @@ func (w writePingAck) writeFrame(ctx writeContext) error {
 	return ctx.Framer().WritePing(true, w.pf.Data)
 }
 
+type writePriority struct {
+	streamID, streamDep uint32
+	exclusive           bool
+	weight              uint8
+}
+
+func (w writePriority) writeFrame(ctx writeContext) error {
+	return ctx.Framer().WritePriority(w.streamID, PriorityParam{
+		Exclusive: w.exclusive,
+		StreamDep: w.streamID,
+		Weight:    w.weight,
+	})
+}
+
 type writeSettingsAck struct{}
 
 func (writeSettingsAck) writeFrame(ctx writeContext) error {
 	return ctx.Framer().WriteSettingsAck()
+}
+
+type writePushPromise struct {
+	streamID  uint32
+	promiseID uint32
+	host      string
+	method    string
+	path      string
+	scheme    string
+	h         http.Header // may be nil
+	endStream bool
+
+	contentType   string
+	contentLength string
+}
+
+func (writePushPromise) writeFrame(ctx writeContext) error {
+	// TODO(bgentry): implement. This is just like writeReqHeaders, except that
+	// the first frame needs to be a PUSH_PROMISE frame instead of a HEADERS
+	// frame. Subsequent headers are still written in CONTINUIATION frames.
+	panic("not implemented yet")
+	return ctx.Framer().WritePushPromise(PushPromiseParam{})
+}
+
+// writeReqHeaders is a request to write a HEADERS and 0+ CONTINUATION frames
+// for HTTP request headers from a transport.
+type writeReqHeaders struct {
+	streamID  uint32
+	host      string
+	method    string
+	path      string
+	h         http.Header // may be nil
+	endStream bool
+
+	contentType   string
+	contentLength string
+}
+
+func (w *writeReqHeaders) writeFrame(ctx writeContext) error {
+	enc, buf := ctx.HeaderEncoder()
+	buf.Reset()
+
+	// TODO(bradfitz): figure out :authority-vs-Host stuff between http2 and Go
+	enc.WriteField(hpack.HeaderField{Name: ":authority", Value: w.host}) // probably not right for all sites
+	enc.WriteField(hpack.HeaderField{Name: ":method", Value: w.method})
+	enc.WriteField(hpack.HeaderField{Name: ":path", Value: w.path})
+	enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
+
+	for k, vv := range w.h {
+		k = lowerHeader(k)
+		if k == "host" {
+			continue
+		}
+		for _, v := range vv {
+			// TODO: more of "8.1.2.2 Connection-Specific Header Fields"
+			if k == "transfer-encoding" && v != "trailers" {
+				continue
+			}
+			enc.WriteField(hpack.HeaderField{Name: k, Value: v})
+		}
+	}
+
+	if w.contentType != "" {
+		enc.WriteField(hpack.HeaderField{Name: "content-type", Value: w.contentType})
+	}
+	if w.contentLength != "" {
+		enc.WriteField(hpack.HeaderField{Name: "content-length", Value: w.contentLength})
+	}
+
+	return writeHeaderBlock(ctx, buf.Bytes(), w.streamID, w.endStream)
 }
 
 // writeResHeaders is a request to write a HEADERS and 0+ CONTINUATION frames
@@ -138,7 +222,10 @@ func (w *writeResHeaders) writeFrame(ctx writeContext) error {
 		enc.WriteField(hpack.HeaderField{Name: "content-length", Value: w.contentLength})
 	}
 
-	headerBlock := buf.Bytes()
+	return writeHeaderBlock(ctx, buf.Bytes(), w.streamID, w.endStream)
+}
+
+func writeHeaderBlock(ctx writeContext, headerBlock []byte, streamID uint32, endStream bool) error {
 	if len(headerBlock) == 0 {
 		panic("unexpected empty hpack")
 	}
@@ -163,13 +250,13 @@ func (w *writeResHeaders) writeFrame(ctx writeContext) error {
 		if first {
 			first = false
 			err = ctx.Framer().WriteHeaders(HeadersFrameParam{
-				StreamID:      w.streamID,
+				StreamID:      streamID,
 				BlockFragment: frag,
-				EndStream:     w.endStream,
+				EndStream:     endStream,
 				EndHeaders:    endHeaders,
 			})
 		} else {
-			err = ctx.Framer().WriteContinuation(w.streamID, endHeaders, frag)
+			err = ctx.Framer().WriteContinuation(streamID, endHeaders, frag)
 		}
 		if err != nil {
 			return err

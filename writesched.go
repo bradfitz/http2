@@ -16,7 +16,10 @@ type frameWriteMsg struct {
 	// to write. The write functions are all defined in write.go.
 	write writeFramer
 
-	stream *stream // used for prioritization. nil for non-stream frames.
+	// stream is nil for non-stream frames. If non-nil, used for
+	// prioritization. If stream.ID == 0, a new stream ID is
+	// reserved and written to stream.ID.
+	stream *stream
 
 	// done, if non-nil, must be a buffered channel with space for
 	// 1 message and is sent the return value from write (or an

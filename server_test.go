@@ -122,7 +122,7 @@ func newServerTester(t testing.TB, handler http.HandlerFunc, opts ...interface{}
 		st.scMu.Lock()
 		defer st.scMu.Unlock()
 		st.sc = v
-		st.sc.testHookCh = make(chan func())
+		st.sc.conn.testHookCh = make(chan func())
 	}
 	log.SetOutput(io.MultiWriter(stderrv, twriter{t: t, st: st}))
 	if !onlyServer {
@@ -140,7 +140,7 @@ func newServerTester(t testing.TB, handler http.HandlerFunc, opts ...interface{}
 func (st *serverTester) closeConn() {
 	st.scMu.Lock()
 	defer st.scMu.Unlock()
-	st.sc.conn.Close()
+	st.sc.conn.conn.Close()
 }
 
 func (st *serverTester) addLogFilter(phrase string) {
@@ -149,16 +149,16 @@ func (st *serverTester) addLogFilter(phrase string) {
 
 func (st *serverTester) stream(id uint32) *stream {
 	ch := make(chan *stream, 1)
-	st.sc.testHookCh <- func() {
-		ch <- st.sc.streams[id]
+	st.sc.conn.testHookCh <- func() {
+		ch <- st.sc.conn.streams[id]
 	}
 	return <-ch
 }
 
 func (st *serverTester) streamState(id uint32) streamState {
 	ch := make(chan streamState, 1)
-	st.sc.testHookCh <- func() {
-		state, _ := st.sc.state(id)
+	st.sc.conn.testHookCh <- func() {
+		state, _ := st.sc.conn.state(id)
 		ch <- state
 	}
 	return <-ch
@@ -1969,7 +1969,7 @@ func TestServer_NoCrash_HandlerClose_Then_ClientClose(t *testing.T) {
 		)
 
 		testHookOnPanicMu.Lock()
-		testHookOnPanic = func(sc *serverConn, pv interface{}) bool {
+		testHookOnPanic = func(c *conn, pv interface{}) bool {
 			panMu.Lock()
 			panicVal = pv
 			panMu.Unlock()
@@ -1980,7 +1980,7 @@ func TestServer_NoCrash_HandlerClose_Then_ClientClose(t *testing.T) {
 		// Now force the serve loop to end, via closing the connection.
 		st.cc.Close()
 		select {
-		case <-st.sc.doneServing:
+		case <-st.sc.conn.done:
 			// Loop has exited.
 			panMu.Lock()
 			got := panicVal
