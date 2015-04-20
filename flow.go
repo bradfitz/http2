@@ -21,6 +21,13 @@ type flow struct {
 
 func (f *flow) setConnFlow(cf *flow) { f.conn = cf }
 
+func (f *flow) availableConn() int32 {
+	if f.conn != nil {
+		return f.conn.n
+	}
+	panic("internal error: run availableConn on conn flow")
+}
+
 func (f *flow) available() int32 {
 	n := f.n
 	if f.conn != nil && f.conn.n < n {
