@@ -8,6 +8,7 @@ import (
 const (
 	defaultWeight    = 15
 	defaulMaxDepTree = 100
+	maxStreamWeight  = 255
 )
 
 var defaultPriority = PriorityParam{
@@ -15,10 +16,30 @@ var defaultPriority = PriorityParam{
 	StreamDep: 0,
 }
 
+type streamDepState int
+
+const (
+	depStateIdle     streamDepState = iota // init state without data
+	depStateReady                          // ready to send but blocked by dependency tree
+	depStateTop                            // can send data
+	depStatFlowDefer                       // blocked by stream flow control
+)
+
+var depStateName = [...]string{
+	depStateIdle:     "Idle",
+	depStateReady:    "Ready",
+	depStateTop:      "Top",
+	depStatFlowDefer: "FlowDefer",
+}
+
+func (ds streamDepState) String() string {
+	return depStateName[ds]
+}
+
 // roots is a list of connection's root streams.
 type roots struct {
-	*list.List        // doubly linked list of all root streams
-	n          uint32 // number of streams in the dependency tree
+	*list.List       // doubly linked list of all root streams
+	n          int32 // number of streams in the dependency tree
 }
 
 func newRoots() *roots {
@@ -43,13 +64,6 @@ func (r *roots) remove(st *stream) {
 // removeAll removes all streams but doesn't flush n.
 func (r *roots) removeAll() {
 	r.Init()
-}
-
-func max(a, b uint8) uint8 {
-	if a < b {
-		return b
-	}
-	return a
 }
 
 // stream represents a stream. This is the minimal metadata needed by
@@ -105,27 +119,45 @@ type stream struct {
 	 */
 
 	// dependency tree
-	streams   map[uint32]*stream // map of all streams
-	depPrev   *stream
-	depNext   *stream
-	sibNext   *stream
-	sibPrev   *stream
-	n         int32         // number of total descendants plus me
-	weightSum int32         // sum of weight of direct descendants (children)
-	roots     *roots        // roots stream struct
-	rootElem  *list.Element // root element in the roots
+	// owned by serverConn's serve loop:
+	streams      map[uint32]*stream // point to server connection streams
+	depPrev      *stream
+	depNext      *stream
+	sibNext      *stream
+	sibPrev      *stream
+	depState     streamDepState // state in dependency tree
+	roots        *roots
+	rootElem     *list.Element // root element in the roots
+	n            int32         // number of total descendants plus me
+	weightSum    int32         // sum of weight of direct descendants
+	weightSumTop int32         // sum of weight of direct descendants that have depStateTop in its dependency tree (at any level deeper)
+	weightEff    int32         // effective weight used for calculating virtual finish for weighted fair queue
 }
 
-func newStream(id uint32, roots *roots, streams map[uint32]*stream) *stream {
+func newStream(id uint32, sc *serverConn, priority PriorityParam) (*stream, error) {
 	st := &stream{
-		id:      id,
-		weight:  defaultWeight,
-		roots:   roots,
-		streams: streams,
-		n:       1,
+		id:        id,
+		weight:    priority.Weight,
+		weightEff: int32(priority.Weight),
+		roots:     sc.roots,
+		streams:   sc.streams,
+		n:         1,
+		depState:  depStateIdle,
 	}
+
+	err := st.createStreamPriority(priority)
+	if err != nil {
+		return nil, err
+	}
+
+	st.cw.Init()
+	st.flow.conn = &sc.flow // link to conn-level counter
+	st.flow.add(sc.initialWindowSize)
+	st.inflow.conn = &sc.inflow      // link to conn-level counter
+	st.inflow.add(initialWindowSize) // TODO: update this when we send a higher initial window size in the initial settings
+
 	st.streams[id] = st
-	return st
+	return st, nil
 }
 
 func (st *stream) String() string {
@@ -148,21 +180,9 @@ func (st *stream) setState(state streamState) {
 	st.state = state
 }
 
-func (st *stream) setupFlow(sc *serverConn) {
-	st.cw.Init()
-	st.flow.conn = &sc.flow // link to conn-level counter
-	st.flow.add(sc.initialWindowSize)
-	st.inflow.conn = &sc.inflow      // link to conn-level counter
-	st.inflow.add(initialWindowSize) // TODO: update this when we send a higher initial window size in the initial settings
-}
-
 func (st *stream) adjustStreamPriority(priority PriorityParam) error {
-	var weight uint8
-	if priority.Weight == 0 {
-		weight = defaultWeight
-	} else {
-		weight = priority.Weight
-	}
+	weight := priority.Weight
+
 	if priority.StreamDep == 0 {
 		st.removeDependentSubTree()
 		st.weight = weight
@@ -209,8 +229,8 @@ func (st *stream) adjustStreamPriority(priority PriorityParam) error {
 		}
 		st.removeDependentSubTree()
 		st.weight = weight
-		rootStream := st.getRoot()
-		if (rootStream.n + st.n) < defaulMaxDepTree {
+		root := st.getRoot()
+		if (root.n + st.n) < defaulMaxDepTree {
 			if priority.Exclusive {
 				parent.insertDependentSubTree(st)
 			} else {
@@ -226,11 +246,6 @@ func (st *stream) adjustStreamPriority(priority PriorityParam) error {
 }
 
 func (st *stream) createStreamPriority(priority PriorityParam) error {
-	if priority.Weight == 0 {
-		st.weight = defaultWeight
-	} else {
-		st.weight = priority.Weight
-	}
 	if priority.StreamDep == 0 {
 		if priority.Exclusive {
 			if st.roots.n < defaulMaxDepTree {
@@ -240,6 +255,7 @@ func (st *stream) createStreamPriority(priority PriorityParam) error {
 			// TODO (brk0v): test this
 			// drop to default weight
 			st.weight = defaultWeight
+			st.weightEff = int32(st.weight)
 		}
 		st.addRoots()
 		return nil
@@ -254,12 +270,13 @@ func (st *stream) createStreamPriority(priority PriorityParam) error {
 		if parent == nil {
 			// TODO (brk0v): rewrite this with support of retention info and idle groups
 			st.weight = defaultWeight
+			st.weightEff = int32(st.weight)
 			st.addRoots()
 			return nil
 		}
 		// TODO (brk0v) test this
-		rootStream := st.getRoot()
-		if rootStream.n < defaulMaxDepTree {
+		root := st.getRoot()
+		if root.n < defaulMaxDepTree {
 			if priority.Exclusive {
 				parent.insertDependent(st)
 			} else {
@@ -268,6 +285,7 @@ func (st *stream) createStreamPriority(priority PriorityParam) error {
 		} else {
 			// TODO (brk0v): test this
 			st.weight = defaultWeight
+			st.weightEff = int32(st.weight)
 			st.addRoots()
 		}
 	}
@@ -284,7 +302,9 @@ func (st *stream) addDependent(chst *stream) {
 		st.linkInsertDependent(chst)
 	}
 
-	_ = st.updateNum(1)
+	root := st.updateNum(1)
+	root.updateWeightSumTop()
+	root.updateWeightEff()
 	chst.roots.n += 1
 }
 
@@ -303,12 +323,16 @@ func (st *stream) insertDependent(chst *stream) {
 	st.depNext = chst
 	chst.depPrev = st
 
-	_ = st.updateNum(1)
+	root := st.updateNum(1)
+	root.updateWeightSumTop()
+	root.updateWeightEff()
 	chst.roots.n += 1
 }
 
 // add sub tree
 func (st *stream) addDependentSubTree(chst *stream) {
+	chst.resetDepStateReady()
+
 	if st.depNext == nil {
 		st.weightSum = int32(chst.weight)
 		st.linkAddDependent(chst)
@@ -317,11 +341,15 @@ func (st *stream) addDependentSubTree(chst *stream) {
 		st.linkInsertDependent(chst)
 	}
 
-	_ = st.updateNum(chst.n)
+	root := st.updateNum(chst.n)
+	root.setDepStateTop()
+	root.updateWeightSumTop()
+	root.updateWeightEff()
 }
 
 func (st *stream) insertDependentSubTree(chst *stream) {
 	d := chst.n
+	chst.resetDepStateReady()
 
 	if st.depNext != nil {
 		chst.n += st.n - 1
@@ -329,6 +357,8 @@ func (st *stream) insertDependentSubTree(chst *stream) {
 		st.weightSum = int32(chst.weight)
 
 		depNext := st.depNext
+		depNext.resetDepStateReady()
+
 		st.linkAddDependent(chst)
 
 		if chst.depNext != nil {
@@ -347,19 +377,27 @@ func (st *stream) insertDependentSubTree(chst *stream) {
 		st.weightSum = int32(chst.weight)
 	}
 
-	_ = st.updateNum(d)
+	root := st.updateNum(d)
+	root.setDepStateTop()
+	root.updateWeightSumTop()
+	root.updateWeightEff()
 }
 
 func (st *stream) closeStream() {
+	st.setDepStateIdle()
 	st.removeDependent()
 }
 
 func (st *stream) removeDependent() {
+	var root *stream
 	delta := -int32(st.weight)
+
 	// distibute weight
 	for s := st.depNext; s != nil; s = s.sibNext {
-		weight := uint8(int32(st.weight) * int32(s.weight) / st.weightSum)
-		s.weight = max(1, weight)
+		s.weight = uint8(int32(st.weight) * int32(s.weight) / st.weightSum)
+		if s.weight == 0 {
+			s.weight = 1
+		}
 		delta += int32(s.weight)
 	}
 
@@ -367,7 +405,7 @@ func (st *stream) removeDependent() {
 	depPrev := firstSib.depPrev
 
 	if depPrev != nil {
-		_ = depPrev.updateNum(-1)
+		root = depPrev.updateNum(-1)
 		depPrev.weightSum += delta
 	}
 
@@ -384,8 +422,16 @@ func (st *stream) removeDependent() {
 			s.depPrev = nil
 			s.sibPrev = nil
 			s.sibNext = nil
+
+			s.weightEff = int32(s.weight)
+
 			s.moveRoots()
 		}
+	}
+
+	if root != nil {
+		root.updateWeightSumTop()
+		root.updateWeightEff()
 	}
 
 	st.n = 1
@@ -394,7 +440,6 @@ func (st *stream) removeDependent() {
 	st.depNext = nil
 	st.sibPrev = nil
 	st.sibNext = nil
-
 	st.roots.n -= 1
 }
 
@@ -426,7 +471,9 @@ func (st *stream) removeDependentSubTree() {
 
 	if depPrev != nil {
 		depPrev.weightSum -= int32(st.weight)
-		_ = depPrev.updateNum(-1 * st.n)
+		root := depPrev.updateNum(-1 * st.n)
+		root.updateWeightSumTop()
+		root.updateWeightEff()
 	}
 
 	st.sibPrev = nil
@@ -467,6 +514,13 @@ func (st *stream) becomeSingleRoot() {
 	}
 	st.roots.removeAll()
 	st.addRoots()
+
+	// update dep tree state and weight
+	st.resetDepStateReady()
+	st.weightEff = int32(st.weight)
+	st.setDepStateTop()
+	st.updateWeightSumTop()
+	st.updateWeightEff()
 }
 
 func (st *stream) linkAddDependent(chst *stream) {
@@ -573,18 +627,143 @@ func (st *stream) isInSubTree(chst *stream, top bool) bool {
 }
 
 // getRoot gets stream's root.
-func (st *stream) getRoot() (root *stream) {
-	root = st
+func (st *stream) getRoot() *stream {
+	root := st
 	for {
-		if s := st.sibPrev; s != nil {
-			root = st.sibPrev
+		if root.sibPrev != nil {
+			root = root.sibPrev
 			continue
 		}
-		if s := st.depPrev; s != nil {
-			root = st.depPrev
+		if root.depPrev != nil {
+			root = root.depPrev
 			continue
 		}
 		break
 	}
 	return root
+}
+
+// setDepStateIdle sets steam's state to depStateIdle and updates dependency tree.
+func (st *stream) setDepStateIdle() {
+	st.depState = depStateIdle
+	root := st.getRoot()
+	root.setDepStateTop()
+	root.updateWeightSumTop()
+	root.updateWeightEff()
+}
+
+// setDepStateTop sets depState to depStateTop starting from stream st.
+// Note: we don't update sibs of this stream.
+func (st *stream) setDepStateTop() {
+	if st.depState == depStateTop {
+		return
+	}
+	if st.depState == depStateReady {
+		st.depState = depStateTop
+		return
+	}
+	// going deeper using dfs:
+	for s := st.depNext; s != nil; s = s.sibNext {
+		s.setDepStateTop()
+	}
+}
+
+// setDepStateReady sets depState to setDepStateReady and updates dependency tree.
+func (st *stream) setDepStateReady() {
+	st.depState = depStateReady
+	if st.depNext != nil {
+		st.depNext.resetDepStateReady()
+	}
+	root := st.getRoot()
+	root.setDepStateTop()
+	root.updateWeightSumTop()
+	root.updateWeightEff()
+}
+
+// setDepStateFlowDefer sets steam's state to depStatFlowDefer and updates dep tree.
+func (st *stream) setDepStateFlowDefer() {
+	st.depState = depStatFlowDefer
+	root := st.getRoot()
+	root.setDepStateTop()
+	root.updateWeightSumTop()
+	root.updateWeightEff()
+}
+
+// resetDepStateReady reset depState to depStateReady.
+func (st *stream) resetDepStateReady() {
+	if st.depState == depStateReady {
+		return
+	}
+	if st.depState == depStateTop {
+		st.depState = depStateReady
+		if st.sibNext != nil {
+			st.sibNext.resetDepStateReady()
+		}
+		return
+	}
+	if st.sibNext != nil {
+		st.sibNext.resetDepStateReady()
+	}
+	if st.depNext != nil {
+		st.depNext.resetDepStateReady()
+	}
+}
+
+// schedule add stream to pq in case of depStateTop recursively.
+func (st *stream) schedule(ws *writeScheduler) {
+	if st.depState == depStateReady {
+		return
+	}
+	if st.depState == depStateTop {
+		if q, ok := ws.sq[st.id]; ok && !q.queued {
+			q.vf = ws.lvf + q.calcVirtFinish(st.weightEff)
+			ws.canSend.push(q)
+		}
+		return
+	}
+	// go deeper
+	for s := st.depNext; s != nil; s = s.sibNext {
+		s.schedule(ws)
+	}
+}
+
+// updateWeightSumTop updates stream WeightSumTop.
+func (st *stream) updateWeightSumTop() bool {
+	st.weightSumTop = 0
+
+	if st.depState == depStateTop {
+		return true
+	}
+	if st.depState == depStateReady {
+		return false
+	}
+
+	rv := false
+	for s := st.depNext; s != nil; s = s.sibNext {
+		if s.updateWeightSumTop() {
+			rv = true
+			st.weightSumTop += int32(s.weight)
+		}
+	}
+
+	return rv
+}
+
+// updateWeightEff updates stream updateWeightEff for pq scheduling.
+func (st *stream) updateWeightEff() {
+	// weightSumTop = 0 means that there is no top stream under
+	if st.weightSumTop == 0 || (st.depState != depStateIdle && st.depState != depStatFlowDefer) {
+		return
+	}
+
+	for s := st.depNext; s != nil; s = s.sibNext {
+		if s.depState != depStateReady {
+			s.weightEff = st.weightEff * int32(s.weight) / st.weightSumTop
+			// min weight 1
+			if s.weightEff == 0 {
+				s.weightEff = 1
+			}
+		}
+		s.updateWeightEff()
+	}
 }

@@ -16,7 +16,7 @@ type rootTest struct {
 	roots               *roots  // roots struct
 	rootFirst, rootLast *stream // first and last root streams
 	l                   int     // number of elements in roots
-	n                   uint32  // number of streams in dependency tree
+	n                   int32   // number of streams in dependency tree
 }
 
 func testRoots(t *testing.T, r rootTest) {
@@ -41,8 +41,6 @@ func testRoots(t *testing.T, r rootTest) {
 	}
 }
 
-var streamTests []streamTest
-
 type streamTest struct {
 	st               *stream // stream for test
 	depPrev, depNext *stream
@@ -64,7 +62,7 @@ func testStreamNode(t *testing.T, streamTests []streamTest) {
 	for _, s := range streamTests {
 		_, file, line, _ := runtime.Caller(1)
 		if s.st.depPrev != s.depPrev || s.st.depNext != s.depNext || s.st.sibPrev != s.sibPrev || s.st.sibNext != s.sibNext {
-			t.Errorf("%s:%d\n", file, line)
+			t.Errorf("%s:%d", file, line)
 			t.Errorf("Stream id: %d", s.st.id)
 			t.Errorf("        Expect  Get")
 			t.Errorf("depPrev: %5s %5s", s.depPrev, s.st.depPrev)
@@ -94,8 +92,10 @@ func testStreamNode(t *testing.T, streamTests []streamTest) {
 }
 
 func TestCloseStream(t *testing.T) {
-	streams := make(map[uint32]*stream)
-	roots := newRoots()
+	sc := &serverConn{
+		roots:   newRoots(),
+		streams: make(map[uint32]*stream),
+	}
 
 	/* Initial dependency:
 	 *
@@ -108,66 +108,52 @@ func TestCloseStream(t *testing.T) {
 	 *                           j(19)
 	 */
 
-	var a, b, c, d, e, f, g, h, i, j, k, l *stream
-
-	a = newStream(1, roots, streams)
-	a.createStreamPriority(defaultPriority)
-	b = newStream(3, roots, streams)
-	b.createStreamPriority(PriorityParam{
+	a, _ := newStream(1, sc, defaultPriority)
+	b, _ := newStream(3, sc, PriorityParam{
 		Weight: 120,
 	})
-	e = newStream(9, roots, streams)
-	e.createStreamPriority(PriorityParam{
+	e, _ := newStream(9, sc, PriorityParam{
 		StreamDep: 0,
 		Weight:    190,
 	})
-	c = newStream(5, roots, streams)
-	c.createStreamPriority(PriorityParam{
+	c, _ := newStream(5, sc, PriorityParam{
 		StreamDep: 1,
 		Weight:    220,
 	})
-	k = newStream(21, roots, streams)
-	k.createStreamPriority(PriorityParam{
+	k, _ := newStream(21, sc, PriorityParam{
 		StreamDep: 1,
 		Weight:    19,
 	})
-	h = newStream(15, roots, streams)
-	h.createStreamPriority(PriorityParam{
+	h, _ := newStream(15, sc, PriorityParam{
 		StreamDep: 1,
 		Weight:    76,
 	})
-	d = newStream(7, roots, streams)
-	d.createStreamPriority(PriorityParam{
+	d, _ := newStream(7, sc, PriorityParam{
 		StreamDep: 9,
 		Weight:    12,
 	})
-	l = newStream(23, roots, streams)
-	l.createStreamPriority(PriorityParam{
+	l, _ := newStream(23, sc, PriorityParam{
 		Weight: 254,
 	})
-	g = newStream(13, roots, streams)
-	g.createStreamPriority(PriorityParam{
+	g, _ := newStream(13, sc, PriorityParam{
 		StreamDep: 15,
 		Weight:    3,
 	})
-	i = newStream(17, roots, streams)
-	i.createStreamPriority(PriorityParam{
+	i, _ := newStream(17, sc, PriorityParam{
 		StreamDep: 15,
 		Weight:    89,
 	})
-	f = newStream(11, roots, streams)
-	f.createStreamPriority(PriorityParam{
+	f, _ := newStream(11, sc, PriorityParam{
 		StreamDep: 7,
 		Weight:    201,
 	})
-	j = newStream(19, roots, streams)
-	j.createStreamPriority(PriorityParam{
+	j, _ := newStream(19, sc, PriorityParam{
 		StreamDep: 13,
 		Weight:    75,
 	})
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: l,
 		rootLast:  a,
 		l:         4,
@@ -311,7 +297,7 @@ func TestCloseStream(t *testing.T) {
 	b.removeDependent()
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: l,
 		rootLast:  a,
 		l:         3,
@@ -333,7 +319,7 @@ func TestCloseStream(t *testing.T) {
 	e.removeDependent()
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: d,
 		rootLast:  a,
 		l:         3,
@@ -375,7 +361,7 @@ func TestCloseStream(t *testing.T) {
 	h.removeDependent()
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: d,
 		rootLast:  a,
 		l:         3,
@@ -487,7 +473,7 @@ func TestCloseStream(t *testing.T) {
 	i.removeDependent()
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: d,
 		rootLast:  a,
 		l:         3,
@@ -589,7 +575,7 @@ func TestCloseStream(t *testing.T) {
 	k.removeDependent()
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: d,
 		rootLast:  a,
 		l:         3,
@@ -684,14 +670,11 @@ func TestCloseStream(t *testing.T) {
 	 *        f(11)            m(25) n(27) j(19) c(5)
 	 */
 
-	var m, n *stream
-	m = newStream(25, roots, streams)
-	m.createStreamPriority(PriorityParam{
+	m, _ := newStream(25, sc, PriorityParam{
 		StreamDep: 1,
 		Weight:    99,
 	})
-	n = newStream(27, roots, streams)
-	n.createStreamPriority(PriorityParam{
+	n, _ := newStream(27, sc, PriorityParam{
 		StreamDep: 13,
 		Weight:    43,
 	})
@@ -699,7 +682,7 @@ func TestCloseStream(t *testing.T) {
 	g.removeDependent()
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: d,
 		rootLast:  a,
 		l:         3,
@@ -850,8 +833,10 @@ func TestCloseStream(t *testing.T) {
 }
 
 func TestCreateStreamPriority(t *testing.T) {
-	streams := make(map[uint32]*stream)
-	roots := newRoots()
+	sc := &serverConn{
+		roots:   newRoots(),
+		streams: make(map[uint32]*stream),
+	}
 
 	/*  Initial dependency:
 	 *
@@ -860,17 +845,14 @@ func TestCreateStreamPriority(t *testing.T) {
 	 *  b(3)
 	 */
 
-	var a, b *stream
-	a = newStream(1, roots, streams)
-	a.createStreamPriority(defaultPriority)
-	b = newStream(3, roots, streams)
-	b.createStreamPriority(PriorityParam{
+	a, _ := newStream(1, sc, defaultPriority)
+	b, _ := newStream(3, sc, PriorityParam{
 		Weight:    20,
 		StreamDep: 1,
 	})
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: a,
 		rootLast:  a,
 		l:         1,
@@ -907,15 +889,13 @@ func TestCreateStreamPriority(t *testing.T) {
 	 *  c(5)  b(3)
 	 */
 
-	var c *stream
-	c = newStream(5, roots, streams)
-	c.createStreamPriority(PriorityParam{
+	c, _ := newStream(5, sc, PriorityParam{
 		Weight:    24,
 		StreamDep: 1,
 	})
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: a,
 		rootLast:  a,
 		l:         1,
@@ -964,27 +944,25 @@ func TestCreateStreamPriority(t *testing.T) {
 	 *         e(9) f(11) d(7)
 	 */
 
-	var d, e, f, g *stream
-	d = newStream(7, roots, streams)
-	d.createStreamPriority(PriorityParam{
+	d, _ := newStream(7, sc, PriorityParam{
+		Weight:    defaultWeight,
 		StreamDep: 3,
 	})
-	e = newStream(9, roots, streams)
-	e.createStreamPriority(PriorityParam{
+	e, _ := newStream(9, sc, PriorityParam{
 		StreamDep: 5,
 		Weight:    60,
 	})
-	f = newStream(11, roots, streams)
-	f.createStreamPriority(PriorityParam{
+	f, _ := newStream(11, sc, PriorityParam{
 		StreamDep: 3,
+		Weight:    defaultWeight,
 	})
-	g = newStream(13, roots, streams)
-	g.createStreamPriority(PriorityParam{
+	g, _ := newStream(13, sc, PriorityParam{
 		StreamDep: 1,
+		Weight:    defaultWeight,
 	})
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: a,
 		rootLast:  a,
 		l:         1,
@@ -1075,16 +1053,14 @@ func TestCreateStreamPriority(t *testing.T) {
 	 *            f(11) d(7)
 	 */
 
-	var j *stream
-	j = newStream(15, roots, streams)
-	j.createStreamPriority(PriorityParam{
+	j, _ := newStream(15, sc, PriorityParam{
 		StreamDep: 3,
 		Weight:    43,
 		Exclusive: true,
 	})
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: a,
 		rootLast:  a,
 		l:         1,
@@ -1147,29 +1123,25 @@ func TestCreateStreamPriority(t *testing.T) {
 	 *                 f(11) d(7)
 	 */
 
-	var h, i *stream
-
-	h = newStream(17, roots, streams)
-	h.createStreamPriority(defaultPriority)
+	h, _ := newStream(17, sc, defaultPriority)
 
 	// intermediate state for roots before Exclusive on 0
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: h,
 		rootLast:  a,
 		l:         2,
 		n:         9,
 	})
 
-	i = newStream(19, roots, streams)
-	i.createStreamPriority(PriorityParam{
+	i, _ := newStream(19, sc, PriorityParam{
 		StreamDep: 0,
 		Exclusive: true,
 		Weight:    244,
 	})
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: i,
 		rootLast:  i,
 		l:         1,
@@ -1295,41 +1267,37 @@ func TestCreateStreamPriority(t *testing.T) {
 	 *
 	 */
 
-	var z, k, l, m, n *stream
+	z, _ := newStream(21, sc, defaultPriority)
 
-	z = newStream(21, roots, streams)
-	z.createStreamPriority(defaultPriority)
+	k, _ := newStream(23, sc, defaultPriority)
 
-	k = newStream(23, roots, streams)
-	k.createStreamPriority(defaultPriority)
-
-	l = newStream(25, roots, streams)
-	l.createStreamPriority(PriorityParam{
+	l, _ := newStream(25, sc, PriorityParam{
 		StreamDep: 23,
+		Weight:    defaultWeight,
 	})
 
-	m = newStream(27, roots, streams)
-	m.createStreamPriority(PriorityParam{
+	m, _ := newStream(27, sc, PriorityParam{
 		StreamDep: 21,
+		Weight:    defaultWeight,
 	})
 
 	// intermediate state for roots before Exclusive on 0
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: k,
 		rootLast:  i,
 		l:         3,
 		n:         14,
 	})
 
-	n = newStream(29, roots, streams)
-	n.createStreamPriority(PriorityParam{
+	n, _ := newStream(29, sc, PriorityParam{
 		StreamDep: 0,
 		Exclusive: true,
+		Weight:    defaultWeight,
 	})
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: n,
 		rootLast:  n,
 		l:         1,
@@ -1402,8 +1370,10 @@ func TestCreateStreamPriority(t *testing.T) {
 }
 
 func TestAdjustStreamPriority(t *testing.T) {
-	streams := make(map[uint32]*stream)
-	roots := newRoots()
+	sc := &serverConn{
+		roots:   newRoots(),
+		streams: make(map[uint32]*stream),
+	}
 
 	/*  Initial dependency
 	 *
@@ -1411,26 +1381,19 @@ func TestAdjustStreamPriority(t *testing.T) {
 	 *
 	 */
 
-	var a, b, c, d, e *stream
-
-	a = newStream(1, roots, streams)
-	a.createStreamPriority(defaultPriority)
-	b = newStream(3, roots, streams)
-	b.createStreamPriority(defaultPriority)
-	c = newStream(5, roots, streams)
-	c.createStreamPriority(PriorityParam{
+	a, _ := newStream(1, sc, defaultPriority)
+	b, _ := newStream(3, sc, defaultPriority)
+	c, _ := newStream(5, sc, PriorityParam{
 		Weight:    144,
 		StreamDep: 0,
 	})
-	d = newStream(7, roots, streams)
-	d.createStreamPriority(PriorityParam{
+	d, _ := newStream(7, sc, PriorityParam{
 		Weight: 254,
 	})
-	e = newStream(9, roots, streams)
-	e.createStreamPriority(defaultPriority)
+	e, _ := newStream(9, sc, defaultPriority)
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: e,
 		rootLast:  a,
 		l:         5,
@@ -1447,6 +1410,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 
 	d.adjustStreamPriority(PriorityParam{
 		StreamDep: 1,
+		Weight:    defaultWeight,
 	})
 	e.adjustStreamPriority(PriorityParam{
 		StreamDep: 5,
@@ -1454,7 +1418,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	})
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: c,
 		rootLast:  a,
 		l:         3,
@@ -1522,30 +1486,22 @@ func TestAdjustStreamPriority(t *testing.T) {
 	 *
 	 */
 
-	var f, g, h, i, j, k *stream
-
-	f = newStream(11, roots, streams)
-	f.createStreamPriority(PriorityParam{
+	f, _ := newStream(11, sc, PriorityParam{
 		Weight: 1,
 	})
-	g = newStream(13, roots, streams)
-	g.createStreamPriority(PriorityParam{
+	g, _ := newStream(13, sc, PriorityParam{
 		Weight:    32,
 		StreamDep: 0,
 	})
-	h = newStream(15, roots, streams)
-	h.createStreamPriority(defaultPriority)
-	i = newStream(17, roots, streams)
-	i.createStreamPriority(PriorityParam{
+	h, _ := newStream(15, sc, defaultPriority)
+	i, _ := newStream(17, sc, PriorityParam{
 		Weight: 141,
 	})
-	j = newStream(19, roots, streams)
-	j.createStreamPriority(defaultPriority)
-	k = newStream(21, roots, streams)
-	k.createStreamPriority(defaultPriority)
+	j, _ := newStream(19, sc, defaultPriority)
+	k, _ := newStream(21, sc, defaultPriority)
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: k,
 		rootLast:  a,
 		l:         9,
@@ -1567,6 +1523,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	})
 	i.adjustStreamPriority(PriorityParam{
 		StreamDep: 13,
+		Weight:    defaultWeight,
 	})
 	j.adjustStreamPriority(PriorityParam{
 		StreamDep: 13,
@@ -1578,13 +1535,15 @@ func TestAdjustStreamPriority(t *testing.T) {
 	})
 	h.adjustStreamPriority(PriorityParam{
 		StreamDep: 21,
+		Weight:    defaultWeight,
 	})
 	b.adjustStreamPriority(PriorityParam{
 		StreamDep: 21,
+		Weight:    defaultWeight,
 	})
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: g,
 		rootLast:  a,
 		l:         3,
@@ -1717,6 +1676,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 
 	k.adjustStreamPriority(PriorityParam{
 		StreamDep: 19,
+		Weight:    defaultWeight,
 	})
 	a.adjustStreamPriority(PriorityParam{
 		StreamDep: 19,
@@ -1724,7 +1684,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	})
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: g,
 		rootLast:  c,
 		l:         2,
@@ -1869,7 +1829,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	})
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: g,
 		rootLast:  g,
 		l:         1,
@@ -2004,21 +1964,14 @@ func TestAdjustStreamPriority(t *testing.T) {
 	 *                                                f(11)  e(9)
 	 */
 
-	var l, m, n, o, p *stream
-
-	l = newStream(23, roots, streams)
-	l.createStreamPriority(defaultPriority)
-	m = newStream(25, roots, streams)
-	m.createStreamPriority(defaultPriority)
-	n = newStream(27, roots, streams)
-	n.createStreamPriority(defaultPriority)
-	o = newStream(29, roots, streams)
-	o.createStreamPriority(defaultPriority)
-	p = newStream(31, roots, streams)
-	p.createStreamPriority(defaultPriority)
+	l, _ := newStream(23, sc, defaultPriority)
+	m, _ := newStream(25, sc, defaultPriority)
+	n, _ := newStream(27, sc, defaultPriority)
+	o, _ := newStream(29, sc, defaultPriority)
+	p, _ := newStream(31, sc, defaultPriority)
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: p,
 		rootLast:  g,
 		l:         6,
@@ -2049,7 +2002,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	})
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: p,
 		rootLast:  g,
 		l:         5,
@@ -2205,6 +2158,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	})
 	n.adjustStreamPriority(PriorityParam{
 		StreamDep: 31,
+		Weight:    defaultWeight,
 	})
 	o.adjustStreamPriority(PriorityParam{
 		StreamDep: 31,
@@ -2217,7 +2171,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	})
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: g,
 		rootLast:  g,
 		l:         1,
@@ -2406,28 +2360,21 @@ func TestAdjustStreamPriority(t *testing.T) {
 	 *  e1(109) d1(107) c1(105)
 	 */
 
-	var a1, b1, c1, d1, e1, f1 *stream
-	a1 = newStream(101, roots, streams)
-	a1.createStreamPriority(defaultPriority)
-	b1 = newStream(103, roots, streams)
-	b1.createStreamPriority(defaultPriority)
-	c1 = newStream(105, roots, streams)
-	c1.createStreamPriority(PriorityParam{
+	a1, _ := newStream(101, sc, defaultPriority)
+	b1, _ := newStream(103, sc, defaultPriority)
+	c1, _ := newStream(105, sc, PriorityParam{
 		StreamDep: 101,
 		Weight:    148,
 	})
-	d1 = newStream(107, roots, streams)
-	d1.createStreamPriority(PriorityParam{
+	d1, _ := newStream(107, sc, PriorityParam{
 		StreamDep: 101,
 		Weight:    3,
 	})
-	e1 = newStream(109, roots, streams)
-	e1.createStreamPriority(PriorityParam{
+	e1, _ := newStream(109, sc, PriorityParam{
 		StreamDep: 101,
 		Weight:    81,
 	})
-	f1 = newStream(111, roots, streams)
-	f1.createStreamPriority(PriorityParam{
+	f1, _ := newStream(111, sc, PriorityParam{
 		StreamDep: 103,
 		Weight:    52,
 	})
@@ -2435,7 +2382,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	// intermediate state for roots before Exclusive on root
 	// don't forget about early roots
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: b1,
 		rootLast:  g,
 		l:         3,
@@ -2449,7 +2396,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	})
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: b1,
 		rootLast:  g,
 		l:         2,
@@ -2579,7 +2526,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	})
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: b1,
 		rootLast:  g,
 		l:         2,
@@ -3015,6 +2962,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	j.adjustStreamPriority(PriorityParam{
 		StreamDep: 5,
 		Exclusive: true,
+		Weight:    defaultWeight,
 	})
 
 	testStreamNode(t, []streamTest{
@@ -3238,7 +3186,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	})
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: f,
 		rootLast:  b1,
 		l:         2,
@@ -3466,7 +3414,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	})
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: m,
 		rootLast:  b1,
 		l:         2,
@@ -3696,7 +3644,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	})
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: h,
 		rootLast:  b1,
 		l:         2,
@@ -3920,7 +3868,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	})
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: j,
 		rootLast:  b1,
 		l:         2,
@@ -4126,7 +4074,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	})
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: c,
 		rootLast:  b1,
 		l:         3,
@@ -4330,7 +4278,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	})
 
 	testRoots(t, rootTest{
-		roots:     roots,
+		roots:     sc.roots,
 		rootFirst: m,
 		rootLast:  m,
 		l:         1,
@@ -4509,4 +4457,156 @@ func TestAdjustStreamPriority(t *testing.T) {
 			n:         6,
 		},
 	})
+}
+
+type streamDataTest struct {
+	st           *stream
+	depState     streamDepState
+	weightSumTop int32
+	weightEff    int32
+}
+
+func testDataAddStream(t *testing.T, streamDataTests []streamDataTest) {
+	for _, s := range streamDataTests {
+		_, file, line, _ := runtime.Caller(1)
+		if s.st.depState != s.depState {
+			t.Errorf("%s:%d", file, line)
+			t.Errorf("Stream id: %d", s.st.id)
+			t.Errorf("          Expect  Get")
+			t.Errorf("depState: %5s %5s", s.depState, s.st.depState)
+		}
+		if s.st.weightSumTop != s.weightSumTop {
+			t.Errorf("%s:%d", file, line)
+			t.Errorf("Stream id: %d", s.st.id)
+			t.Errorf("             Expect  Get")
+			t.Errorf("weightSumTop: %5d %5d", s.weightSumTop, s.st.weightSumTop)
+		}
+		if s.st.weightEff != s.weightEff {
+			t.Errorf("%s:%d", file, line)
+			t.Errorf("Stream id: %d", s.st.id)
+			t.Errorf("           Expect  Get")
+			t.Errorf("weightEff: %5d %5d", s.weightEff, s.st.weightEff)
+		}
+	}
+}
+
+func TestDataAddStream(t *testing.T) {
+	sc := &serverConn{
+		roots:             newRoots(),
+		streams:           make(map[uint32]*stream),
+		initialWindowSize: initialWindowSize,
+	}
+	sc.flow.add(initialWindowSize)
+	sc.inflow.add(initialWindowSize)
+	ws := newWriteScheduler(sc.roots)
+
+	/* Dependency tree:
+	 *
+	 *       _______a(1)_____
+	 *      /        |       \
+	 *    h(15)     k(21)    c(5)
+	 *   /   \                |
+	 * i(17) g(13)           m(23)
+	 *        |
+	 *       j(19)
+	 */
+
+	a, _ := newStream(1, sc, defaultPriority)
+	c, _ := newStream(5, sc, PriorityParam{
+		StreamDep: 1,
+		Weight:    220,
+	})
+	k, _ := newStream(21, sc, PriorityParam{
+		StreamDep: 1,
+		Weight:    19,
+	})
+	h, _ := newStream(15, sc, PriorityParam{
+		StreamDep: 1,
+		Weight:    76,
+	})
+	g, _ := newStream(13, sc, PriorityParam{
+		StreamDep: 15,
+		Weight:    3,
+	})
+	i, _ := newStream(17, sc, PriorityParam{
+		StreamDep: 15,
+		Weight:    89,
+	})
+	j, _ := newStream(19, sc, PriorityParam{
+		StreamDep: 13,
+		Weight:    75,
+	})
+	m, _ := newStream(23, sc, PriorityParam{
+		StreamDep: 5,
+		Weight:    166,
+	})
+
+	ws.add(frameWriteMsg{
+		write:  &writeData{p: []byte{0, 0, 0}},
+		stream: c,
+	})
+	ws.add(frameWriteMsg{
+		write:  &writeData{p: []byte{0, 0, 0}},
+		stream: i,
+	})
+	ws.add(frameWriteMsg{
+		write:  &writeData{p: []byte{0, 0, 0}},
+		stream: j,
+	})
+	ws.add(frameWriteMsg{
+		write:  &writeData{p: []byte{0, 0, 0}},
+		stream: m,
+	})
+
+	testDataAddStream(t, []streamDataTest{
+		streamDataTest{
+			st:           a,
+			depState:     depStateIdle,
+			weightSumTop: sumWeight(h, c),
+			weightEff:    sumWeight(a),
+		},
+		streamDataTest{
+			st:           c,
+			depState:     depStateTop,
+			weightSumTop: 0, // because we are top
+			weightEff:    11,
+		},
+		streamDataTest{
+			st:           g,
+			depState:     depStateIdle,
+			weightSumTop: sumWeight(j),
+			weightEff:    1, //h.weightEff * g.weight / h.weightSumTop,
+		},
+		streamDataTest{
+			st:           h,
+			depState:     depStateIdle,
+			weightSumTop: sumWeight(i, g),
+			weightEff:    3,
+		},
+		streamDataTest{
+			st:           i,
+			depState:     depStateTop,
+			weightSumTop: 0,
+			weightEff:    2,
+		},
+		streamDataTest{
+			st:           j,
+			depState:     depStateTop,
+			weightSumTop: 0,
+			weightEff:    1,
+		},
+		streamDataTest{
+			st:           k,
+			depState:     depStateIdle,
+			weightSumTop: 0,
+			weightEff:    16 * 19 / (76 + 220), // this data not used for scheduling
+		},
+		streamDataTest{
+			st:           m,
+			depState:     depStateReady,
+			weightSumTop: 0,
+			weightEff:    sumWeight(m),
+		},
+	})
+
 }

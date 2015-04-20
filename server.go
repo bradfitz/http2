@@ -193,29 +193,28 @@ func ConfigureServer(s *http.Server, conf *Server) {
 }
 
 func (srv *Server) handleConn(hs *http.Server, c net.Conn, h http.Handler) {
+	roots := newRoots()
 	sc := &serverConn{
-		srv:              srv,
-		hs:               hs,
-		conn:             c,
-		remoteAddrStr:    c.RemoteAddr().String(),
-		bw:               newBufferedWriter(c),
-		handler:          h,
-		streams:          make(map[uint32]*stream),
-		readFrameCh:      make(chan frameAndGate),
-		readFrameErrCh:   make(chan error, 1), // must be buffered for 1
-		wantWriteFrameCh: make(chan frameWriteMsg, 8),
-		wroteFrameCh:     make(chan struct{}, 1), // buffered; one send in reading goroutine
-		bodyReadCh:       make(chan bodyReadMsg), // buffering doesn't matter either way
-		doneServing:      make(chan struct{}),
-		advMaxStreams:    srv.maxConcurrentStreams(),
-		writeSched: writeScheduler{
-			maxFrameSize: initialMaxFrameSize,
-		},
+		srv:               srv,
+		hs:                hs,
+		conn:              c,
+		remoteAddrStr:     c.RemoteAddr().String(),
+		bw:                newBufferedWriter(c),
+		handler:           h,
+		streams:           make(map[uint32]*stream),
+		readFrameCh:       make(chan frameAndGate),
+		readFrameErrCh:    make(chan error, 1), // must be buffered for 1
+		wantWriteFrameCh:  make(chan frameWriteMsg, 8),
+		wroteFrameCh:      make(chan struct{}, 1), // buffered; one send in reading goroutine
+		bodyReadCh:        make(chan bodyReadMsg), // buffering doesn't matter either way
+		doneServing:       make(chan struct{}),
+		advMaxStreams:     srv.maxConcurrentStreams(),
+		writeSched:        newWriteScheduler(roots),
 		initialWindowSize: initialWindowSize,
 		headerTableSize:   initialHeaderTableSize,
 		serveG:            newGoroutineLock(),
 		pushEnabled:       true,
-		roots:             newRoots(),
+		roots:             roots,
 	}
 	sc.flow.add(initialWindowSize)
 	sc.inflow.add(initialWindowSize)
@@ -999,6 +998,10 @@ func (sc *serverConn) processWindowUpdate(f *WindowUpdateFrame) error {
 		if !st.flow.add(int32(f.Increment)) {
 			return StreamError{f.StreamID, ErrCodeFlowControl}
 		}
+		// update dependecy tree state
+		if st.depState == depStatFlowDefer {
+			st.setDepStateReady()
+		}
 	default: // connection-level flow control
 		if !sc.flow.add(int32(f.Increment)) {
 			return goAwayFlowError{}
@@ -1196,18 +1199,14 @@ func (sc *serverConn) processHeaders(f *HeadersFrame) error {
 		sc.maxStreamID = id
 	}
 
-	st := newStream(id, sc.roots, sc.streams)
-	var err error
+	priority := defaultPriority
 	if f.HasPriority() {
-		err = st.createStreamPriority(f.Priority)
-	} else {
-		err = st.createStreamPriority(defaultPriority)
+		priority = f.Priority
 	}
+	st, err := newStream(id, sc, priority)
 	if err != nil {
 		return err
 	}
-
-	st.setupFlow(sc)
 	if f.StreamEnded() {
 		st.setState(stateHalfClosedRemote)
 	} else {

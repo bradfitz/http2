@@ -7,7 +7,9 @@
 
 package http2
 
-import "fmt"
+import (
+	"fmt"
+)
 
 // frameWriteMsg is a request to write a frame.
 type frameWriteMsg struct {
@@ -39,6 +41,14 @@ func (wm frameWriteMsg) String() string {
 	return fmt.Sprintf("[frameWriteMsg stream=%d, ch=%v, type: %v]", streamID, wm.done != nil, des)
 }
 
+func (wm frameWriteMsg) len() int {
+	if wd, ok := wm.write.(*writeData); ok {
+		return len(wd.p)
+	}
+	panic("internal error: get len on no writeData")
+
+}
+
 // writeScheduler tracks pending frames to write, priorities, and decides
 // the next one to use. It is not thread-safe.
 type writeScheduler struct {
@@ -54,14 +64,28 @@ type writeScheduler struct {
 	// when a stream is idle, it's deleted from the map.
 	sq map[uint32]*writeQueue
 
-	// canSend is a slice of memory that's reused between frame
+	// canSend is a priority queue that's reused between frame
 	// scheduling decisions to hold the list of writeQueues (from sq)
-	// which have enough flow control data to send. After canSend is
-	// built, the best is selected.
-	canSend []*writeQueue
+	// which are not blocked by other streams by dependeny tree.
+	// canSend updated on every scheduler take() call.
+	canSend *priorityQueue
 
 	// pool of empty queues for reuse.
 	queuePool []*writeQueue
+
+	// double linked list of roots streams
+	roots *roots
+
+	// last virtual finish for weighted fair queuing algorithm
+	lvf int32
+}
+
+func newWriteScheduler(roots *roots) writeScheduler {
+	return writeScheduler{
+		maxFrameSize: initialMaxFrameSize,
+		roots:        roots,
+		canSend:      newPriorityQueue(),
+	}
 }
 
 func (ws *writeScheduler) putEmptyQueue(q *writeQueue) {
@@ -89,6 +113,10 @@ func (ws *writeScheduler) add(wm frameWriteMsg) {
 		ws.zero.push(wm)
 	} else {
 		ws.streamQueue(st.id).push(wm)
+		// update dependency tree for writeData
+		if _, ok := wm.write.(*writeData); ok {
+			st.setDepStateReady()
+		}
 	}
 }
 
@@ -120,7 +148,6 @@ func (ws *writeScheduler) take() (wm frameWriteMsg, ok bool) {
 	if len(ws.sq) == 0 {
 		return
 	}
-
 	// Next, prioritize frames on streams that aren't DATA frames (no cost).
 	for id, q := range ws.sq {
 		if q.firstIsNoCost() {
@@ -128,33 +155,51 @@ func (ws *writeScheduler) take() (wm frameWriteMsg, ok bool) {
 		}
 	}
 
-	// Now, all that remains are DATA frames with non-zero bytes to
-	// send. So pick the best one.
-	if len(ws.canSend) != 0 {
-		panic("should be empty")
+	// update canSend pq
+	for re := ws.roots.Front(); re != nil; re = re.Next() {
+		root := re.Value.(*stream)
+		root.schedule(ws)
 	}
-	for _, q := range ws.sq {
+
+	for ws.canSend.len() > 0 {
+		q := ws.canSend.pop()
+		st := q.stream()
+
+		if st.depState != depStateTop {
+			// We have higher priority data to sent.
+			// This protects us from sending old stale data from closed stream
+			// or after reprioritization and rebuilding dependency tree.
+			continue
+		}
+
+		// Check flow control
 		if n := ws.streamWritableBytes(q); n > 0 {
-			ws.canSend = append(ws.canSend, q)
+			wm, ok = ws.takeFrom(q.streamID(), q)
+			if ok {
+				// update scheduler's last virt finish
+				ws.lvf += int32(wm.len()) * maxStreamWeight / st.weightEff
+				// if we have more data then queue it
+				if !q.empty() {
+					q.vf = ws.lvf + q.calcVirtFinish(st.weightEff)
+					ws.canSend.push(q)
+				} else {
+					// no data to send but stream is alive
+					// so unblock dependency tree
+					st.setDepStateIdle()
+				}
+			}
+			return wm, ok
+		} else if st.flow.availableConn() == 0 {
+			// don't have connection window
+			// just put data back in pq without recalc vf
+			ws.canSend.push(q)
+			return
+		} else {
+			// don't have enough stream flow
+			st.setDepStateFlowDefer()
 		}
 	}
-	if len(ws.canSend) == 0 {
-		return
-	}
-	defer ws.zeroCanSend()
-
-	// TODO: find the best queue
-	q := ws.canSend[0]
-
-	return ws.takeFrom(q.streamID(), q)
-}
-
-// zeroCanSend is defered from take.
-func (ws *writeScheduler) zeroCanSend() {
-	for i := range ws.canSend {
-		ws.canSend[i] = nil
-	}
-	ws.canSend = ws.canSend[:0]
+	return
 }
 
 // streamWritableBytes returns the number of DATA bytes we could write
@@ -242,15 +287,30 @@ func (ws *writeScheduler) forgetStream(id uint32) {
 		q.s[i] = frameWriteMsg{}
 	}
 	q.s = q.s[:0]
+	q.vf = 0
 	ws.putEmptyQueue(q)
 }
 
 type writeQueue struct {
-	s []frameWriteMsg
+	s      []frameWriteMsg
+	vf     int32 // virtual finish for weighted fair queuing algorithm and place in pq
+	queued bool  // in priority queue?
+}
+
+// for debugging only:
+func (q writeQueue) String() string {
+	return fmt.Sprintf("[writeQueue stream=%d, vf=%v]", q.stream().id, q.vf)
+}
+
+func (q writeQueue) calcVirtFinish(w int32) int32 {
+	return int32(q.head().len()) * maxStreamWeight / w
 }
 
 // streamID returns the stream ID for a non-empty stream-specific queue.
 func (q *writeQueue) streamID() uint32 { return q.s[0].stream.id }
+
+// stream returns the stream for a non-empty stream-specific queue.
+func (q *writeQueue) stream() *stream { return q.s[0].stream }
 
 func (q *writeQueue) empty() bool { return len(q.s) == 0 }
 
