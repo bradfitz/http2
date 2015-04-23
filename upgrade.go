@@ -203,7 +203,7 @@ func (m *upgradeMux) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 					sc.req.header.Set(sc.canonicalHeader(k), strings.Join(vals, "; "))
 					continue
 				}
-				if _, ok := ignoreUpgradeHeaders[strings.ToLower(k)]; !ok {
+				if _, ok := ignoreUpgradeHeaders[lowerHeader(k)]; !ok {
 					for _, v := range vals {
 						if VerboseLogs {
 							sc.vlogf("got header field %+v", &hdr{sc, k, v})
