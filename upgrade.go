@@ -199,6 +199,10 @@ func (m *upgradeMux) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 				}
 			}
 			for k, vals := range r.Header {
+				if k == "Cookie" {
+					sc.req.header.Set(sc.canonicalHeader(k), strings.Join(vals, "; "))
+					continue
+				}
 				if _, ok := ignoreUpgradeHeaders[strings.ToLower(k)]; !ok {
 					for _, v := range vals {
 						if VerboseLogs {
