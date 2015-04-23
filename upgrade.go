@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 )
@@ -28,6 +29,12 @@ type upgradeMux struct {
 	handler http.Handler
 	srv     *http.Server
 	conf    *Server
+}
+
+type mrcloser struct {
+	io.Reader
+
+	closers []io.Closer
 }
 
 type hdr struct {
@@ -63,6 +70,32 @@ func decodeSettings(b []byte) ([]Setting, error) {
 	return nil, err
 }
 
+func (mrc *mrcloser) Close() (err error) {
+	for _, c := range mrc.closers {
+		defer func(c io.Closer) {
+			if e := c.Close(); e != nil && err == nil {
+				err = e
+			}
+		}(c)
+	}
+	return
+}
+
+func multiReadCloser(readers ...io.Reader) io.ReadCloser {
+	mrc := &mrcloser{
+		Reader:  io.MultiReader(readers...),
+		closers: make([]io.Closer, 0, len(readers)),
+	}
+
+	for _, r := range readers {
+		if c, ok := r.(io.Closer); ok {
+			mrc.closers = append(mrc.closers, c)
+		}
+	}
+
+	return mrc
+}
+
 func (m *upgradeMux) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	if upg := r.Header.Get("Upgrade"); upg == "h2c-14" || upg == "h2c" {
 		hj, ok := rw.(http.Hijacker)
@@ -88,6 +121,21 @@ func (m *upgradeMux) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		data := []byte{0}
+		n, err := r.Body.Read(data)
+		if err != nil && err != io.EOF {
+			http.Error(rw, err.Error(), 501)
+			return
+		}
+
+		// Currently, request bodies in the upgrade request are not supported,
+		// so hand this off to http/1.1 if there's one or more bytes pending.
+		if n > 0 {
+			r.Body = multiReadCloser(bytes.NewBuffer(data), r.Body)
+			m.handler.ServeHTTP(rw, r)
+			return
+		}
+		r.Body.Close()
 		h := rw.Header()
 
 		for k, _ := range h {
@@ -128,7 +176,7 @@ func (m *upgradeMux) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			sc.req = requestParam{
 				stream:           st,
 				method:           r.Method,
-				path:             r.RequestURI,
+				path:             r.URL.RequestURI(),
 				scheme:           r.URL.Scheme,
 				authority:        r.Host,
 				sawRegularHeader: true,
@@ -196,6 +244,12 @@ func (m *upgradeMux) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 // perform the protocol switch. Any changes to uri handling must be made in the
 // "inner" server *before* it is passed to UpgradeServer(). The standard
 // http.DefaultServeMux will always be used as a last resort.
+//
+// NB: Note that HTTP/1.1 requests with bodies (i.e. HTTP POST) are not
+// supported in the initial Upgrade request but will work once the connection
+// is fully HTTP/2. Requests that have content entities will automatically
+// fallback to HTTP/1.1 (the upgrade silently fails but the normal handler
+// is invoked).
 func UpgradeServer(s *http.Server, conf *Server) *http.Server {
 	if conf == nil {
 		conf = new(Server)
