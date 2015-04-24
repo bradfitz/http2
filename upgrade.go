@@ -156,6 +156,10 @@ func (m *upgradeMux) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		var sc *serverConn
 		sc, err = m.conf.newConn(m.srv, c, m.handler, settings, func() {
 			defer close(sc.upgradeCh)
+
+			if testHookOnConn != nil {
+				testHookOnConn()
+			}
 			if sc.maxStreamID < 1 {
 				sc.maxStreamID = 1
 			}
@@ -264,14 +268,16 @@ func UpgradeServer(s *http.Server, conf *Server) *http.Server {
 		handler = http.DefaultServeMux
 	}
 
-	ConfigureServer(s, conf)
 	h1s := new(http.Server)
 	*h1s = *s
+	h1s.TLSConfig = nil
+	h1s.TLSNextProto = nil
 	h1s.Handler = &upgradeMux{
 		handler: handler,
 		srv:     s,
 		conf:    conf,
 	}
 
+	ConfigureServer(s, conf)
 	return h1s
 }
