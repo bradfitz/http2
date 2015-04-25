@@ -726,10 +726,18 @@ func (sc *serverConn) writeDataFromHandler(stream *stream, writeData *writeData,
 // goroutine, call writeFrame instead.
 func (sc *serverConn) writeFrameFromHandler(wm frameWriteMsg) {
 	sc.serveG.checkNotOn() // NOT
+	cleanup := false
 	select {
 	case sc.wantWriteFrameCh <- wm:
 	case <-sc.doneServing:
 		// Client has closed their connection to the server.
+		cleanup = true
+	case <-wm.stream.cw:
+		cleanup = true
+	}
+	// don't block writers expecting a reply
+	if ch := wm.done; cleanup && ch != nil {
+		ch <- errStreamBroken
 	}
 }
 
@@ -764,6 +772,14 @@ func (sc *serverConn) startFrameWrite(wm frameWriteMsg) {
 			panic("internal error: attempt to send frame on half-closed-local stream")
 		case stateClosed:
 			if st.sentReset || st.gotReset {
+				// don't block writers expecting a reply
+				if ch := wm.done; ch != nil {
+					select {
+					case ch <- errStreamBroken:
+					default:
+						panic(fmt.Sprintf("unbuffered done channel passed in for type %T", wm.write))
+					}
+				}
 				// Skip this frame. But fake the frame write to reschedule:
 				sc.wroteFrameCh <- struct{}{}
 				return
@@ -1455,6 +1471,8 @@ func (sc *serverConn) writeHeaders(st *stream, headerData *writeResHeaders, temp
 		case <-errc:
 			// Ignore. Just for synchronization.
 			// Any error will be handled in the writing goroutine.
+		case <-st.cw:
+			// stream close
 		case <-sc.doneServing:
 			// Client has closed the connection.
 		}
@@ -1641,7 +1659,8 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 			endStream:     endStream,
 			contentType:   ctype,
 			contentLength: clen,
-		}, rws.frameWriteCh)
+		}, make(chan error, 1))
+
 		if endStream {
 			return 0, nil
 		}
@@ -1653,7 +1672,7 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 	curWrite.streamID = rws.stream.id
 	curWrite.p = p
 	curWrite.endStream = rws.handlerDone
-	if err := rws.conn.writeDataFromHandler(rws.stream, curWrite, rws.frameWriteCh); err != nil {
+	if err := rws.conn.writeDataFromHandler(rws.stream, curWrite, make(chan error, 1)); err != nil {
 		return 0, err
 	}
 	return len(p), nil
