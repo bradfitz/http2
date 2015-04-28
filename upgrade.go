@@ -240,24 +240,27 @@ func (m *upgradeMux) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 //
 // Ex usage:
 //
-// http.HandleFunc("/", func(rw http.ResponseWriter, r *http.Request) {
-// 				rw.Header().Set("Content-Type", "text/plain")
-// 				fmt.Fprintf(rw, "response to %v\n", r)
-// })
+// 		http.HandleFunc("/", func(rw http.ResponseWriter, r *http.Request) {
+// 			rw.Header().Set("Content-Type", "text/plain")
+// 			fmt.Fprintf(rw, "response to %v\n", r)
+// 		})
 //
-// s := http2.UpgradeServer(&http.Server{Addr:":8080"},nil)
-// s.ListenAndServe()
+// 		s := http2.UpgradeServer(&http.Server{Addr:":8080"},&http2.Server{})
+// 		s.ListenAndServe()
 //
 // NB: Do *not* alter the returned server's Handler, as it is hooked in order to
 // perform the protocol switch. Any changes to uri handling must be made in the
 // "inner" server *before* it is passed to UpgradeServer(). The standard
 // http.DefaultServeMux will always be used as a last resort.
 //
-// NB: Note that HTTP/1.1 requests with bodies (i.e. HTTP POST) are not
-// supported in the initial Upgrade request but will work once the connection
-// is fully HTTP/2. Requests that have content entities will automatically
-// fallback to HTTP/1.1 (the upgrade silently fails but the normal handler
-// is invoked).
+// NB: Note that HTTP/1.1 requests with bodies (i.e. HTTP POST) are not supported
+// in the initial Upgrade request but will work once the connection is fully
+// HTTP/2. Requests that have content entities will automatically fallback to
+// HTTP/1.1 (the upgrade silently fails but the normal handler is invoked). The
+// HTTP/2 spec offers an additional mechanism for performing an upgrade pre-POST
+// by using an "OPTIONS * HTTP/1.1" request w/ upgrade mechanism, but this is not
+// currently possible using net/http w/out wrapping incoming connections and
+// filtering them.
 func UpgradeServer(s *http.Server, conf *Server) *http.Server {
 	if conf == nil {
 		conf = new(Server)
