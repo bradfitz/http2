@@ -42,6 +42,7 @@ package http2
 import (
 	"bufio"
 	"bytes"
+	"container/list"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -112,6 +113,17 @@ type Server struct {
 	// PermitProhibitedCipherSuites, if true, permits the use of
 	// cipher suites prohibited by the HTTP/2 spec.
 	PermitProhibitedCipherSuites bool
+
+	// MaxDependencyTree optionally specifies how deep can be dependecy tree.
+	MaxDependencyTree int32
+
+	// MaxSavedIdleStreams optionally specifies how many idle streams server
+	// permits to create for dependency tree grouping.
+	MaxSavedIdleStreams int
+
+	// MaxSavedClosedStreams optionally specifies how many closed streams
+	// server retain for prioritization purpoces.
+	MaxSavedClosedStreams int
 }
 
 func (s *Server) maxReadFrameSize() uint32 {
@@ -126,6 +138,27 @@ func (s *Server) maxConcurrentStreams() uint32 {
 		return v
 	}
 	return defaultMaxStreams
+}
+
+func (s *Server) maxDependencyTree() int32 {
+	if v := s.MaxDependencyTree; v > 0 {
+		return v
+	}
+	return defaultMaxDependencyTree
+}
+
+func (s *Server) maxSavedIdleStreams() int {
+	if v := s.MaxSavedIdleStreams; v > 0 {
+		return v
+	}
+	return defaultMaxSavedIdleStreams
+}
+
+func (s *Server) maxSavedClosedStreams() int {
+	if v := s.MaxSavedClosedStreams; v > 0 {
+		return v
+	}
+	return defaultMaxSavedClosedStreams
 }
 
 // ConfigureServer adds HTTP/2 support to a net/http Server.
@@ -195,26 +228,31 @@ func ConfigureServer(s *http.Server, conf *Server) {
 func (srv *Server) handleConn(hs *http.Server, c net.Conn, h http.Handler) {
 	roots := newRoots()
 	sc := &serverConn{
-		srv:               srv,
-		hs:                hs,
-		conn:              c,
-		remoteAddrStr:     c.RemoteAddr().String(),
-		bw:                newBufferedWriter(c),
-		handler:           h,
-		streams:           make(map[uint32]*stream),
-		readFrameCh:       make(chan frameAndGate),
-		readFrameErrCh:    make(chan error, 1), // must be buffered for 1
-		wantWriteFrameCh:  make(chan frameWriteMsg, 8),
-		wroteFrameCh:      make(chan struct{}, 1), // buffered; one send in reading goroutine
-		bodyReadCh:        make(chan bodyReadMsg), // buffering doesn't matter either way
-		doneServing:       make(chan struct{}),
-		advMaxStreams:     srv.maxConcurrentStreams(),
-		writeSched:        newWriteScheduler(roots),
-		initialWindowSize: initialWindowSize,
-		headerTableSize:   initialHeaderTableSize,
-		serveG:            newGoroutineLock(),
-		pushEnabled:       true,
-		roots:             roots,
+		srv:                   srv,
+		hs:                    hs,
+		conn:                  c,
+		remoteAddrStr:         c.RemoteAddr().String(),
+		bw:                    newBufferedWriter(c),
+		handler:               h,
+		streams:               make(map[uint32]*stream),
+		readFrameCh:           make(chan frameAndGate),
+		readFrameErrCh:        make(chan error, 1), // must be buffered for 1
+		wantWriteFrameCh:      make(chan frameWriteMsg, 8),
+		wroteFrameCh:          make(chan struct{}, 1), // buffered; one send in reading goroutine
+		bodyReadCh:            make(chan bodyReadMsg), // buffering doesn't matter either way
+		doneServing:           make(chan struct{}),
+		advMaxStreams:         srv.maxConcurrentStreams(),
+		writeSched:            newWriteScheduler(roots),
+		initialWindowSize:     initialWindowSize,
+		headerTableSize:       initialHeaderTableSize,
+		serveG:                newGoroutineLock(),
+		pushEnabled:           true,
+		roots:                 roots,
+		maxDependencyTree:     srv.maxDependencyTree(),
+		idles:                 list.New(),
+		maxSavedIdleStreams:   srv.maxSavedIdleStreams(),
+		closeds:               list.New(),
+		maxSavedClosedStreams: srv.maxSavedClosedStreams(),
 	}
 	sc.flow.add(initialWindowSize)
 	sc.inflow.add(initialWindowSize)
@@ -365,7 +403,11 @@ type serverConn struct {
 	shutdownTimerCh       <-chan time.Time // nil until used
 	shutdownTimer         *time.Timer      // nil until used
 	roots                 *roots           // roots streams
-
+	maxDependencyTree     int32            // how deep mb dependency tree
+	idles                 *list.List       // idles streams for creating priority groups
+	maxSavedIdleStreams   int
+	closeds               *list.List // closed streams that retained for proper priority
+	maxSavedClosedStreams int
 	// Owned by the writeFrameAsync goroutine:
 	headerWriteBuf bytes.Buffer
 	hpackEncoder   *hpack.Encoder
@@ -546,8 +588,17 @@ func (sc *serverConn) writeFrameAsync(wm frameWriteMsg) {
 func (sc *serverConn) closeAllStreamsOnConnClose() {
 	sc.serveG.check()
 	for _, st := range sc.streams {
-		sc.closeStream(st, errClientDisconnected)
+		if st.state != stateClosed && st.state != stateIdle {
+			sc.closeStream(st, errClientDisconnected)
+		}
 	}
+	for sc.idles.Len() != 0 {
+		sc.removeIdle(sc.idles.Back())
+	}
+	for sc.closeds.Len() != 0 {
+		sc.removeClosed(sc.closeds.Back())
+	}
+
 }
 
 func (sc *serverConn) stopShutdownTimer() {
@@ -760,7 +811,7 @@ func (sc *serverConn) startFrameWrite(wm frameWriteMsg) {
 			// at top of this file), we go into closed
 			// state here anyway, after telling the peer
 			// we're hanging up on them.
-			st.state = stateHalfClosedLocal // won't last long, but necessary for closeStream via resetStream
+			st.setState(sc, stateHalfClosedLocal) // won't last long, but necessary for closeStream via resetStream
 			errCancel := StreamError{st.id, ErrCodeCancel}
 			sc.resetStream(errCancel)
 		case stateHalfClosedRemote:
@@ -841,7 +892,8 @@ func (sc *serverConn) shutDownIn(d time.Duration) {
 func (sc *serverConn) resetStream(se StreamError) {
 	sc.serveG.check()
 	sc.writeFrame(frameWriteMsg{write: se})
-	if st, ok := sc.streams[se.StreamID]; ok {
+	state, st := sc.state(se.StreamID)
+	if state != stateClosed && state != stateIdle && st != nil {
 		st.sentReset = true
 		sc.closeStream(st, se)
 	}
@@ -986,8 +1038,8 @@ func (sc *serverConn) processWindowUpdate(f *WindowUpdateFrame) error {
 	sc.serveG.check()
 	switch {
 	case f.StreamID != 0: // stream-level flow control
-		st := sc.streams[f.StreamID]
-		if st == nil {
+		state, st := sc.state(f.StreamID)
+		if state == stateIdle || state == stateClosed || st == nil {
 			// "WINDOW_UPDATE can be sent by a peer that has sent a
 			// frame bearing the END_STREAM flag. This means that a
 			// receiver could receive a WINDOW_UPDATE frame on a "half
@@ -999,7 +1051,7 @@ func (sc *serverConn) processWindowUpdate(f *WindowUpdateFrame) error {
 			return StreamError{f.StreamID, ErrCodeFlowControl}
 		}
 		// update dependecy tree state
-		if st.depState == depStatFlowDefer {
+		if st.depState == depStateFlowDefer {
 			st.setDepStateReady()
 		}
 	default: // connection-level flow control
@@ -1023,7 +1075,7 @@ func (sc *serverConn) processResetStream(f *RSTStreamFrame) error {
 		// (Section 5.4.1) of type PROTOCOL_ERROR.
 		return ConnectionError(ErrCodeProtocol)
 	}
-	if st != nil {
+	if state != stateClosed && st != nil {
 		st.gotReset = true
 		sc.closeStream(st, StreamError{f.StreamID, f.ErrCode})
 	}
@@ -1036,17 +1088,34 @@ func (sc *serverConn) closeStream(st *stream, err error) {
 		panic(fmt.Sprintf("invariant; can't close stream in state %v", st.state))
 	}
 
-	st.state = stateClosed
+	st.setState(sc, stateClosed)
 	sc.curOpenStreams--
-	if s, ok := sc.streams[st.id]; ok {
-		delete(sc.streams, st.id)
-		s.closeStream()
-	}
+
 	if p := st.body; p != nil {
 		p.Close(err)
 	}
 	st.cw.Close() // signals Handler's CloseNotifier, unblocks writes, etc
+
+	// set depState to depStateIdle for unblocking dependency tree scheduler
+	st.setDepStateIdle()
 	sc.writeSched.forgetStream(st.id)
+}
+
+func (sc *serverConn) removeIdle(idleElem *list.Element) {
+	idleStream := idleElem.Value.(*stream)
+	// idle stream don't have cw or entry in writeSched
+	// so just delete it from streams and from dependency tree
+	delete(sc.streams, idleStream.id)
+	// we don't need to call setDepStateIdle() becuase we was idle
+	idleStream.removeDependent()
+	sc.idles.Remove(idleElem)
+}
+
+func (sc *serverConn) removeClosed(closedElem *list.Element) {
+	closedStream := closedElem.Value.(*stream)
+	delete(sc.streams, closedStream.id)
+	closedStream.removeDependent()
+	sc.closeds.Remove(closedElem)
 }
 
 func (sc *serverConn) processSettings(f *SettingsFrame) error {
@@ -1131,8 +1200,8 @@ func (sc *serverConn) processData(f *DataFrame) error {
 	// or "half closed (local)" state, the recipient MUST respond
 	// with a stream error (Section 5.4.2) of type STREAM_CLOSED."
 	id := f.Header().StreamID
-	st, ok := sc.streams[id]
-	if !ok || st.state != stateOpen {
+	state, st := sc.state(id)
+	if state != stateOpen {
 		// This includes sending a RST_STREAM if the stream is
 		// in stateHalfClosedLocal (which currently means that
 		// the http.Handler returned, so it's done reading &
@@ -1172,7 +1241,7 @@ func (sc *serverConn) processData(f *DataFrame) error {
 		} else {
 			st.body.Close(io.EOF)
 		}
-		st.state = stateHalfClosedRemote
+		st.setState(sc, stateHalfClosedRemote)
 	}
 	return nil
 }
@@ -1208,9 +1277,9 @@ func (sc *serverConn) processHeaders(f *HeadersFrame) error {
 		return err
 	}
 	if f.StreamEnded() {
-		st.setState(stateHalfClosedRemote)
+		st.setState(sc, stateHalfClosedRemote)
 	} else {
-		st.setState(stateOpen)
+		st.setState(sc, stateOpen)
 	}
 	sc.curOpenStreams++
 	sc.req = requestParam{
@@ -1222,7 +1291,7 @@ func (sc *serverConn) processHeaders(f *HeadersFrame) error {
 
 func (sc *serverConn) processContinuation(f *ContinuationFrame) error {
 	sc.serveG.check()
-	st := sc.streams[f.Header().StreamID]
+	_, st := sc.state(f.Header().StreamID)
 	if st == nil || sc.curHeaderStreamID() != st.id {
 		return ConnectionError(ErrCodeProtocol)
 	}
@@ -1273,50 +1342,49 @@ func (sc *serverConn) processHeaderBlockFragment(st *stream, frag []byte, end bo
 }
 
 func (sc *serverConn) processPriority(f *PriorityFrame) error {
-	st, ok := sc.streams[f.StreamID]
-	if !ok {
-		// TODO (brk0v): not quite correct (this streamID might
-		// already exist in the dep tree, but be closed), but
-		// close enough for now.
+	if f.StreamID == 0 {
+		// 6.3 PRIORITY
+		// If a PRIORITY frame is received with a stream identifier of 0x0,
+		// the recipient MUST respond with a connection error (Section 5.4.1)
+		// of type PROTOCOL_ERROR.
+		return ConnectionError(ErrCodeProtocol)
+	}
+
+	state, st := sc.state(f.StreamID)
+	if st == nil && state == stateIdle {
+		// Priority on a idle parent stream
+		//
+		// 5.3.4 Prioritization State Management
+		// ... streams that are in the "idle" state can be assigned priority
+		// or become a parent of other streams. This allows for the creation
+		// of a grouping node in the dependency tree, which enables more
+		// flexible expressions of priority. Idle streams begin with a
+		// default priority (Section 5.3.5)
+		id := f.StreamID
+		if id%2 != 1 {
+			// trying to create idle anchor on pushed ids
+			return nil
+		}
+		if id > sc.maxStreamID {
+			sc.maxStreamID = id
+		}
+		st, err := newStream(id, sc, f.PriorityParam)
+		fmt.Println(f.PriorityParam)
+		if err != nil {
+			return err
+		}
+		// set stateIdle and don't increment concurrent counter
+		st.setState(sc, stateIdle)
+	} else if st == nil && state == stateClosed {
+		// Handle stream priority on closed stream
+		// we've alredy deleted this stream because of maxSavedClosedStreams
+		// so nothing to do here.
 		return nil
-	}
-	return st.adjustStreamPriority(f.PriorityParam)
-}
-
-func adjustStreamPriority(streams map[uint32]*stream, streamID uint32, priority PriorityParam) {
-	st, ok := streams[streamID]
-	if !ok {
-		// TODO: not quite correct (this streamID might
-		// already exist in the dep tree, but be closed), but
-		// close enough for now.
-		return
-	}
-	st.weight = priority.Weight
-	parent := streams[priority.StreamDep] // might be nil
-	if parent == st {
-		// if client tries to set this stream to be the parent of itself
-		// ignore and keep going
-		return
+	} else if st != nil {
+		return st.adjustStreamPriority(sc, f.PriorityParam)
 	}
 
-	// section 5.3.3: If a stream is made dependent on one of its
-	// own dependencies, the formerly dependent stream is first
-	// moved to be dependent on the reprioritized stream's previous
-	// parent. The moved dependency retains its weight.
-	for piter := parent; piter != nil; piter = piter.parent {
-		if piter == st {
-			parent.parent = st.parent
-			break
-		}
-	}
-	st.parent = parent
-	if priority.Exclusive && (st.parent != nil || priority.StreamDep == 0) {
-		for _, openStream := range streams {
-			if openStream != st && openStream.parent == st.parent {
-				openStream.parent = st
-			}
-		}
-	}
+	return nil
 }
 
 // resetPendingRequest zeros out all state related to a HEADERS frame

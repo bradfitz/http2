@@ -52,32 +52,6 @@ var (
 	clientPreface = []byte(ClientPreface)
 )
 
-type streamState int
-
-const (
-	stateIdle streamState = iota
-	stateOpen
-	stateHalfClosedLocal
-	stateHalfClosedRemote
-	stateResvLocal
-	stateResvRemote
-	stateClosed
-)
-
-var stateName = [...]string{
-	stateIdle:             "Idle",
-	stateOpen:             "Open",
-	stateHalfClosedLocal:  "HalfClosedLocal",
-	stateHalfClosedRemote: "HalfClosedRemote",
-	stateResvLocal:        "ResvLocal",
-	stateResvRemote:       "ResvRemote",
-	stateClosed:           "Closed",
-}
-
-func (st streamState) String() string {
-	return stateName[st]
-}
-
 // Setting is a setting parameter: which setting it is, and its value.
 type Setting struct {
 	// ID is which setting is being set.

@@ -1,4 +1,19 @@
-// This example demonstrates a priority queue built using the heap interface.
+// Copyright 2015 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+// See https://code.google.com/p/go/source/browse/CONTRIBUTORS
+// Licensed under the same terms as Go itself:
+// https://code.google.com/p/go/source/browse/LICENSE
+
+// Package http2 implements the HTTP/2 protocol.
+//
+// This is a work in progress. This package is low-level and intended
+// to be used directly by very few people. Most users will use it
+// indirectly through integration with the net/http package. See
+// ConfigureServer. That ConfigureServer call will likely be automatic
+// or available via an empty import in the future.
+//
+// See http://http2.github.io/
 package http2
 
 import (

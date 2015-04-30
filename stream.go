@@ -6,30 +6,58 @@ import (
 )
 
 const (
-	defaultWeight    = 15
-	defaulMaxDepTree = 100
-	maxStreamWeight  = 255
+	defaultWeight                = 16
+	maxStreamWeight              = 256
+	defaultMaxDependencyTree     = 100
+	defaultMaxSavedIdleStreams   = 10
+	defaultMaxSavedClosedStreams = 10
 )
 
 var defaultPriority = PriorityParam{
-	Weight:    defaultWeight,
+	Weight:    defaultWeight - 1, // uint8 and incrementing while prioritizing
 	StreamDep: 0,
+}
+
+type streamState int
+
+const (
+	stateIdle streamState = iota
+	stateOpen
+	stateHalfClosedLocal
+	stateHalfClosedRemote
+	stateResvLocal
+	stateResvRemote
+	stateClosed
+)
+
+var stateName = [...]string{
+	stateIdle:             "Idle",
+	stateOpen:             "Open",
+	stateHalfClosedLocal:  "HalfClosedLocal",
+	stateHalfClosedRemote: "HalfClosedRemote",
+	stateResvLocal:        "ResvLocal",
+	stateResvRemote:       "ResvRemote",
+	stateClosed:           "Closed",
+}
+
+func (st streamState) String() string {
+	return stateName[st]
 }
 
 type streamDepState int
 
 const (
-	depStateIdle     streamDepState = iota // init state without data
-	depStateReady                          // ready to send but blocked by dependency tree
-	depStateTop                            // can send data
-	depStatFlowDefer                       // blocked by stream flow control
+	depStateIdle      streamDepState = iota // init state without data
+	depStateReady                           // ready to send but blocked by dependency tree
+	depStateTop                             // can send data
+	depStateFlowDefer                       // blocked by stream flow control
 )
 
 var depStateName = [...]string{
-	depStateIdle:     "Idle",
-	depStateReady:    "Ready",
-	depStateTop:      "Top",
-	depStatFlowDefer: "FlowDefer",
+	depStateIdle:      "Idle",
+	depStateReady:     "Ready",
+	depStateTop:       "Top",
+	depStateFlowDefer: "FlowDefer",
 }
 
 func (ds streamDepState) String() string {
@@ -85,7 +113,7 @@ type stream struct {
 	flow          flow    // limits writing from Handler to client
 	inflow        flow    // what the client is allowed to POST/etc to us
 	parent        *stream // or nil
-	weight        uint8
+	weight        int32
 	state         streamState
 	sentReset     bool // only true once detached from streams map
 	gotReset      bool // only true once detacted from streams map
@@ -120,7 +148,6 @@ type stream struct {
 
 	// dependency tree
 	// owned by serverConn's serve loop:
-	streams      map[uint32]*stream // point to server connection streams
 	depPrev      *stream
 	depNext      *stream
 	sibNext      *stream
@@ -132,20 +159,28 @@ type stream struct {
 	weightSum    int32         // sum of weight of direct descendants
 	weightSumTop int32         // sum of weight of direct descendants that have depStateTop in its dependency tree (at any level deeper)
 	weightEff    int32         // effective weight used for calculating virtual finish for weighted fair queue
+	idleElem     *list.Element // idle stream element in the idles
+	closedElem   *list.Element // closed stream element in the closeds
+
 }
 
 func newStream(id uint32, sc *serverConn, priority PriorityParam) (*stream, error) {
-	st := &stream{
-		id:        id,
-		weight:    priority.Weight,
-		weightEff: int32(priority.Weight),
-		roots:     sc.roots,
-		streams:   sc.streams,
-		n:         1,
-		depState:  depStateIdle,
+	sc.serveG.check()
+
+	if state, st := sc.state(id); state == stateIdle && st != nil {
+		// creating stream that alredy created by priority frame
+		// see "5.3.4 Prioritization State Management" for details.
+		sc.removeIdle(st.idleElem)
 	}
 
-	err := st.createStreamPriority(priority)
+	st := &stream{
+		id:       id,
+		roots:    sc.roots,
+		n:        1,
+		depState: depStateIdle,
+	}
+
+	err := st.createStreamPriority(sc, priority)
 	if err != nil {
 		return nil, err
 	}
@@ -156,12 +191,13 @@ func newStream(id uint32, sc *serverConn, priority PriorityParam) (*stream, erro
 	st.inflow.conn = &sc.inflow      // link to conn-level counter
 	st.inflow.add(initialWindowSize) // TODO: update this when we send a higher initial window size in the initial settings
 
-	st.streams[id] = st
+	sc.streams[id] = st
 	return st, nil
 }
 
+// for debugging only:
 func (st *stream) String() string {
-	return fmt.Sprintf("%d", st.id)
+	return fmt.Sprintf("[stream stream=%d weight=%d weightSum=%d weightEff=%d]", st.id, st.weight, st.weightSum, st.weightEff)
 }
 
 func (st *stream) addRoots() {
@@ -176,39 +212,169 @@ func (st *stream) removeRoots() {
 	st.roots.remove(st)
 }
 
-func (st *stream) setState(state streamState) {
+func (st *stream) setState(sc *serverConn, state streamState) {
+	switch state {
+	case stateIdle:
+		// create idle stream on dependency tree as a grouping node for
+		// priority purposes.
+		st.idleElem = sc.idles.PushFront(st)
+		// recycle old
+		for sc.idles.Len() > sc.maxSavedIdleStreams {
+			sc.removeIdle(sc.idles.Back())
+		}
+	case stateClosed:
+		// 5.3.4 Prioritization State Management
+		//... an endpoint SHOULD retain stream prioritization state for a period
+		// after streams become closed. The longer state is retained, the lower
+		// the chance that streams are assigned incorrect or default priority
+		// values.
+		st.closedElem = sc.closeds.PushFront(st)
+		// recycle old
+		for sc.closeds.Len() > sc.maxSavedClosedStreams {
+			sc.removeClosed(sc.closeds.Back())
+		}
+	}
+
 	st.state = state
 }
 
-func (st *stream) adjustStreamPriority(priority PriorityParam) error {
-	weight := priority.Weight
-
-	if priority.StreamDep == 0 {
-		st.removeDependentSubTree()
-		st.weight = weight
+func (st *stream) createStreamPriority(sc *serverConn, priority PriorityParam) error {
+	sc.serveG.check()
+	st.weight = int32(priority.Weight) + 1 // calc real weight
+	st.weightEff = st.weight
+	parentID := priority.StreamDep
+	if parentID == 0 {
 		if priority.Exclusive {
-			if st.roots.n < defaulMaxDepTree {
+			if st.roots.n < sc.maxDependencyTree {
 				st.becomeSingleRoot()
 				return nil
 			}
 			// TODO (brk0v): test this
 			// drop to default weight
 			st.weight = defaultWeight
+			st.weightEff = st.weight
 		}
-		st.moveRoots()
+		st.addRoots()
 		return nil
 	} else {
-		parent := st.streams[priority.StreamDep] // might be nil
+		var err error
+		state, parent := sc.state(parentID)
 		if parent == st {
 			// TODO (brk0v): test this
 			// A stream cannot depend on itself. An endpoint MUST treat this as
 			// a stream error (Section 5.4.2) of type PROTOCOL_ERROR.
 			return StreamError{st.id, ErrCodeProtocol}
 		}
-		if parent == nil {
-			// TODO (brk0v): rewrite this with support of retention info and idle groups
+		if parent == nil && state == stateIdle {
+			// Priority on a idle parent stream
+			//
+			// 5.3.4 Prioritization State Management
+			// ... streams that are in the "idle" state can be assigned priority
+			// or become a parent of other streams. This allows for the creation
+			// of a grouping node in the dependency tree, which enables more
+			// flexible expressions of priority. Idle streams begin with a
+			// default priority (Section 5.3.5)
+			if parentID%2 != 1 {
+				// trying to create idle anchor on pushed ids
+				return nil
+			}
+			if parentID > sc.maxStreamID {
+				sc.maxStreamID = parentID
+			}
+			parent, err = newStream(parentID, sc, defaultPriority)
+			if err != nil {
+				return err
+			}
+			// set stateIdle and don't increment concurrent counter
+			parent.setState(sc, stateIdle)
+		}
+		if parent == nil && state == stateClosed {
+			// we've alredy deleted this stream because of maxSavedClosedStreams
+			// so drop stream to default priority
 			st.weight = defaultWeight
+			st.weightEff = st.weight
+			st.addRoots()
+			// nothing to do here
+			return nil
+		}
+		// TODO (brk0v) test this
+		root := st.getRoot()
+		if root.n < sc.maxDependencyTree {
+			if priority.Exclusive {
+				parent.insertDependent(st)
+			} else {
+				parent.addDependent(st)
+			}
+		} else {
+			// TODO (brk0v): test this
+			st.weight = defaultWeight
+			st.weightEff = st.weight
+			st.addRoots()
+		}
+	}
+	return nil
+}
+
+func (st *stream) adjustStreamPriority(sc *serverConn, priority PriorityParam) error {
+	sc.serveG.check()
+	weight := int32(priority.Weight) + 1 // calc real weight
+	parentID := priority.StreamDep
+	if parentID == 0 {
+		st.removeDependentSubTree()
+		st.weight = weight
+		st.weightEff = st.weight
+		if priority.Exclusive {
+			if st.roots.n < sc.maxDependencyTree {
+				st.becomeSingleRoot()
+				return nil
+			}
+			// TODO (brk0v): test this
+			// drop to default weight
+			st.weight = defaultWeight
+			st.weightEff = st.weight
+		}
+		st.moveRoots()
+		return nil
+	} else {
+		var err error
+		state, parent := sc.state(parentID)
+		if parent == st {
+			// TODO (brk0v): test this
+			// A stream cannot depend on itself. An endpoint MUST treat this as
+			// a stream error (Section 5.4.2) of type PROTOCOL_ERROR.
+			return StreamError{st.id, ErrCodeProtocol}
+		}
+		if parent == nil && state == stateIdle {
+			// Priority on a idle parent stream
+			//
+			// 5.3.4 Prioritization State Management
+			// ... streams that are in the "idle" state can be assigned priority
+			// or become a parent of other streams. This allows for the creation
+			// of a grouping node in the dependency tree, which enables more
+			// flexible expressions of priority. Idle streams begin with a
+			// default priority (Section 5.3.5)
+			if parentID%2 != 1 {
+				// trying to create idle anchor on pushed ids
+				return nil
+			}
+			if parentID > sc.maxStreamID {
+				sc.maxStreamID = parentID
+			}
+			parent, err = newStream(parentID, sc, defaultPriority)
+			if err != nil {
+				return err
+			}
+			// set stateIdle and don't increment concurrent counter
+			parent.setState(sc, stateIdle)
+		}
+		if parent == nil && state == stateClosed {
+			// we've alredy deleted this stream because of maxSavedClosedStreams
+			// so drop stream to default priority
+			st.removeDependentSubTree()
+			st.weight = defaultWeight
+			st.weightEff = st.weight
 			st.moveRoots()
+			// nothing to reprioritize here
 			return nil
 		}
 		// 5.3.3 Reprioritization
@@ -218,7 +384,7 @@ func (st *stream) adjustStreamPriority(priority PriorityParam) error {
 		// reprioritized stream's previous parent. The moved dependency retains
 		// its weight.
 		if st.isInSubTree(parent, true) {
-			// TODO (brk0v): defaulMaxDepTree checks?
+			// TODO (brk0v): sc.maxDependencyTree checks?
 			parent.removeDependentSubTree()
 			first := st.firstSib()
 			if first.depPrev != nil {
@@ -230,7 +396,7 @@ func (st *stream) adjustStreamPriority(priority PriorityParam) error {
 		st.removeDependentSubTree()
 		st.weight = weight
 		root := st.getRoot()
-		if (root.n + st.n) < defaulMaxDepTree {
+		if (root.n + st.n) < sc.maxDependencyTree {
 			if priority.Exclusive {
 				parent.insertDependentSubTree(st)
 			} else {
@@ -239,54 +405,8 @@ func (st *stream) adjustStreamPriority(priority PriorityParam) error {
 		} else {
 			// TODO (brk0v): test this
 			st.weight = defaultWeight
+			st.weightEff = st.weight
 			st.moveRoots()
-		}
-	}
-	return nil
-}
-
-func (st *stream) createStreamPriority(priority PriorityParam) error {
-	if priority.StreamDep == 0 {
-		if priority.Exclusive {
-			if st.roots.n < defaulMaxDepTree {
-				st.becomeSingleRoot()
-				return nil
-			}
-			// TODO (brk0v): test this
-			// drop to default weight
-			st.weight = defaultWeight
-			st.weightEff = int32(st.weight)
-		}
-		st.addRoots()
-		return nil
-	} else {
-		parent := st.streams[priority.StreamDep] // might be nil
-		if parent == st {
-			// TODO (brk0v): test this
-			// A stream cannot depend on itself. An endpoint MUST treat this as
-			// a stream error (Section 5.4.2) of type PROTOCOL_ERROR.
-			return StreamError{st.id, ErrCodeProtocol}
-		}
-		if parent == nil {
-			// TODO (brk0v): rewrite this with support of retention info and idle groups
-			st.weight = defaultWeight
-			st.weightEff = int32(st.weight)
-			st.addRoots()
-			return nil
-		}
-		// TODO (brk0v) test this
-		root := st.getRoot()
-		if root.n < defaulMaxDepTree {
-			if priority.Exclusive {
-				parent.insertDependent(st)
-			} else {
-				parent.addDependent(st)
-			}
-		} else {
-			// TODO (brk0v): test this
-			st.weight = defaultWeight
-			st.weightEff = int32(st.weight)
-			st.addRoots()
 		}
 	}
 	return nil
@@ -294,7 +414,7 @@ func (st *stream) createStreamPriority(priority PriorityParam) error {
 
 // addDependent adds dependentcy to parent stream st.
 func (st *stream) addDependent(chst *stream) {
-	st.weightSum += int32(chst.weight)
+	st.weightSum += chst.weight
 
 	if st.depNext == nil {
 		st.linkAddDependent(chst)
@@ -311,7 +431,7 @@ func (st *stream) addDependent(chst *stream) {
 // insertDependent inserts exclusive dependent stream chst to parent st.
 func (st *stream) insertDependent(chst *stream) {
 	chst.weightSum = st.weightSum
-	st.weightSum = int32(chst.weight)
+	st.weightSum = chst.weight
 
 	if st.depNext != nil {
 		for s := st.depNext; s != nil; s = s.sibNext {
@@ -334,10 +454,10 @@ func (st *stream) addDependentSubTree(chst *stream) {
 	chst.resetDepStateReady()
 
 	if st.depNext == nil {
-		st.weightSum = int32(chst.weight)
+		st.weightSum = chst.weight
 		st.linkAddDependent(chst)
 	} else {
-		st.weightSum += int32(chst.weight)
+		st.weightSum += chst.weight
 		st.linkInsertDependent(chst)
 	}
 
@@ -354,7 +474,7 @@ func (st *stream) insertDependentSubTree(chst *stream) {
 	if st.depNext != nil {
 		chst.n += st.n - 1
 		chst.weightSum += st.weightSum
-		st.weightSum = int32(chst.weight)
+		st.weightSum = chst.weight
 
 		depNext := st.depNext
 		depNext.resetDepStateReady()
@@ -374,7 +494,7 @@ func (st *stream) insertDependentSubTree(chst *stream) {
 		if st.weightSum != 0 {
 			panic("wrong weightSum for stream!")
 		}
-		st.weightSum = int32(chst.weight)
+		st.weightSum = chst.weight
 	}
 
 	root := st.updateNum(d)
@@ -383,22 +503,22 @@ func (st *stream) insertDependentSubTree(chst *stream) {
 	root.updateWeightEff()
 }
 
-func (st *stream) closeStream() {
+/*func (st *stream) closeStream() {
 	st.setDepStateIdle()
 	st.removeDependent()
-}
+}*/
 
 func (st *stream) removeDependent() {
 	var root *stream
-	delta := -int32(st.weight)
+	delta := -st.weight
 
 	// distibute weight
 	for s := st.depNext; s != nil; s = s.sibNext {
-		s.weight = uint8(int32(st.weight) * int32(s.weight) / st.weightSum)
+		s.weight = st.weight * s.weight / st.weightSum
 		if s.weight == 0 {
 			s.weight = 1
 		}
-		delta += int32(s.weight)
+		delta += s.weight
 	}
 
 	firstSib := st.firstSib()
@@ -423,7 +543,7 @@ func (st *stream) removeDependent() {
 			s.sibPrev = nil
 			s.sibNext = nil
 
-			s.weightEff = int32(s.weight)
+			s.weightEff = s.weight
 
 			s.moveRoots()
 		}
@@ -470,7 +590,7 @@ func (st *stream) removeDependentSubTree() {
 	}
 
 	if depPrev != nil {
-		depPrev.weightSum -= int32(st.weight)
+		depPrev.weightSum -= st.weight
 		root := depPrev.updateNum(-1 * st.n)
 		root.updateWeightSumTop()
 		root.updateWeightEff()
@@ -486,13 +606,13 @@ func (st *stream) becomeSingleRoot() {
 		last := st.roots.Front()
 		lastStream := last.Value.(*stream)
 
-		st.weightSum += int32(lastStream.weight)
+		st.weightSum += lastStream.weight
 		st.n += lastStream.n
 
 		prevStream := lastStream
 		for s := last.Next(); s != nil; s = s.Next() {
 			sib := s.Value.(*stream)
-			st.weightSum += int32(sib.weight)
+			st.weightSum += sib.weight
 			st.n += sib.n
 			prevStream.linkSib(sib)
 			prevStream = sib
@@ -517,7 +637,7 @@ func (st *stream) becomeSingleRoot() {
 
 	// update dep tree state and weight
 	st.resetDepStateReady()
-	st.weightEff = int32(st.weight)
+	st.weightEff = st.weight
 	st.setDepStateTop()
 	st.updateWeightSumTop()
 	st.updateWeightEff()
@@ -680,9 +800,9 @@ func (st *stream) setDepStateReady() {
 	root.updateWeightEff()
 }
 
-// setDepStateFlowDefer sets steam's state to depStatFlowDefer and updates dep tree.
+// setDepStateFlowDefer sets steam's state to depStateFlowDefer and updates dep tree.
 func (st *stream) setDepStateFlowDefer() {
-	st.depState = depStatFlowDefer
+	st.depState = depStateFlowDefer
 	root := st.getRoot()
 	root.setDepStateTop()
 	root.updateWeightSumTop()
@@ -742,7 +862,7 @@ func (st *stream) updateWeightSumTop() bool {
 	for s := st.depNext; s != nil; s = s.sibNext {
 		if s.updateWeightSumTop() {
 			rv = true
-			st.weightSumTop += int32(s.weight)
+			st.weightSumTop += s.weight
 		}
 	}
 
@@ -752,13 +872,13 @@ func (st *stream) updateWeightSumTop() bool {
 // updateWeightEff updates stream updateWeightEff for pq scheduling.
 func (st *stream) updateWeightEff() {
 	// weightSumTop = 0 means that there is no top stream under
-	if st.weightSumTop == 0 || (st.depState != depStateIdle && st.depState != depStatFlowDefer) {
+	if st.weightSumTop == 0 || (st.depState != depStateIdle && st.depState != depStateFlowDefer) {
 		return
 	}
 
 	for s := st.depNext; s != nil; s = s.sibNext {
 		if s.depState != depStateReady {
-			s.weightEff = st.weightEff * int32(s.weight) / st.weightSumTop
+			s.weightEff = st.weightEff * s.weight / st.weightSumTop
 			// min weight 1
 			if s.weightEff == 0 {
 				s.weightEff = 1

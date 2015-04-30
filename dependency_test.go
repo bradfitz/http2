@@ -24,12 +24,12 @@ func testRoots(t *testing.T, r rootTest) {
 	if r.roots.Front().Value.(*stream) != r.rootFirst {
 		t.Errorf("%s:%d", file, line)
 		t.Errorf("Roots First element error. ")
-		t.Errorf("Expect: %s get: %s", r.rootFirst, r.roots.Front().Value.(*stream))
+		t.Errorf("Expect: %d get: %d", r.rootFirst.id, r.roots.Front().Value.(*stream).id)
 	}
 	if r.roots.Back().Value.(*stream) != r.rootLast {
 		t.Errorf("%s:%d", file, line)
 		t.Errorf("Roots Last element error. ")
-		t.Errorf("Expect: %s get: %s", r.rootLast, r.roots.Back().Value.(*stream))
+		t.Errorf("Expect: %d get: %d", r.rootLast.id, r.roots.Back().Value.(*stream).id)
 	}
 	if r.roots.Len() != r.l {
 		t.Errorf("%s:%d", file, line)
@@ -46,13 +46,13 @@ type streamTest struct {
 	depPrev, depNext *stream
 	sibPrev, sibNext *stream
 	n                int32 // number streams in subtree
-	weight           uint8
+	weight           int32
 	weightSum        int32 // sum of weights of direct descendants (children)
 }
 
 func sumWeight(streams ...*stream) (sum int32) {
 	for _, s := range streams {
-		sum += int32(s.weight)
+		sum += s.weight
 	}
 	return
 }
@@ -65,10 +65,10 @@ func testStreamNode(t *testing.T, streamTests []streamTest) {
 			t.Errorf("%s:%d", file, line)
 			t.Errorf("Stream id: %d", s.st.id)
 			t.Errorf("        Expect  Get")
-			t.Errorf("depPrev: %5s %5s", s.depPrev, s.st.depPrev)
-			t.Errorf("depNext: %5s %5s", s.depNext, s.st.depNext)
-			t.Errorf("sibPrev: %5s %5s", s.sibPrev, s.st.sibPrev)
-			t.Errorf("sibNext: %5s %5s", s.sibNext, s.st.sibNext)
+			t.Errorf("depPrev: %5d %5d", s.depPrev.id, s.st.depPrev.id)
+			t.Errorf("depNext: %5d %5d", s.depNext.id, s.st.depNext.id)
+			t.Errorf("sibPrev: %5d %5d", s.sibPrev.id, s.st.sibPrev.id)
+			t.Errorf("sibNext: %5d %5d", s.sibNext.id, s.st.sibNext.id)
 		}
 		if s.st.n != s.n {
 			t.Errorf("%s:%d", file, line)
@@ -82,19 +82,33 @@ func testStreamNode(t *testing.T, streamTests []streamTest) {
 			t.Errorf("         Expect  Get")
 			t.Errorf("weightSum: %5d %5d", s.weightSum, s.st.weightSum)
 		}
-		if s.st.weight != s.weight {
+		if s.st.weight-1 != s.weight {
 			t.Errorf("%s:%d", file, line)
 			t.Errorf("Stream id: %d", s.st.id)
 			t.Errorf("       Expect  Get")
-			t.Errorf("weight: %5d %5d", s.weight, s.st.weight)
+			t.Errorf("weight: %5d %5d", s.weight, s.st.weight-1)
 		}
 	}
 }
 
-func TestCloseStream(t *testing.T) {
+/*
+ * Tests Remove Stream from dependency tree
+ * ========================================
+ *
+ * - update roots
+ * - update weightSum
+ * - update depPrev, depNext, sibPrev, sibNext
+ * - num of streams in dependency tree
+ */
+
+func TestRemoveDependent(t *testing.T) {
 	sc := &serverConn{
-		roots:   newRoots(),
-		streams: make(map[uint32]*stream),
+		roots:                 newRoots(),
+		streams:               make(map[uint32]*stream),
+		serveG:                newGoroutineLock(),
+		maxDependencyTree:     defaultMaxDependencyTree,
+		maxSavedClosedStreams: defaultMaxSavedClosedStreams,
+		maxSavedIdleStreams:   defaultMaxSavedIdleStreams,
 	}
 
 	/* Initial dependency:
@@ -167,7 +181,7 @@ func TestCloseStream(t *testing.T) {
 			depNext:   h,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(h, k, c),
 			n:         7,
 		},
@@ -375,7 +389,7 @@ func TestCloseStream(t *testing.T) {
 			depNext:   i,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(i, g, k, c),
 			n:         6,
 		},
@@ -425,7 +439,7 @@ func TestCloseStream(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   g,
-			weight:    73,
+			weight:    72,
 			weightSum: 0,
 			n:         1,
 		},
@@ -487,7 +501,7 @@ func TestCloseStream(t *testing.T) {
 			depNext:   g,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(g, k, c),
 			n:         5,
 		},
@@ -589,7 +603,7 @@ func TestCloseStream(t *testing.T) {
 			depNext:   g,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(g, c),
 			n:         4,
 		},
@@ -696,7 +710,7 @@ func TestCloseStream(t *testing.T) {
 			depNext:   m,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(m, n, j, c),
 			n:         5,
 		},
@@ -726,7 +740,7 @@ func TestCloseStream(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   n,
 			sibNext:   c,
-			weight:    1, // distributed weight
+			weight:    0, // distributed weight
 			weightSum: 0,
 			n:         1,
 		},
@@ -756,7 +770,7 @@ func TestCloseStream(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   m,
 			sibNext:   j,
-			weight:    1, // distributed weight
+			weight:    0, // distributed weight
 			weightSum: 0,
 			n:         1,
 		},
@@ -805,7 +819,7 @@ func TestCloseStream(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    73,
+			weight:    72,
 			weightSum: 0,
 			n:         1,
 		},
@@ -832,10 +846,24 @@ func TestCloseStream(t *testing.T) {
 	})
 }
 
+/*
+ * Tests Create Stream with Priority
+ * =================================
+ *
+ * - update roots
+ * - update weightSum
+ * - update depPrev, depNext, sibPrev, sibNext
+ * - num of streams in dependency tree
+ */
+
 func TestCreateStreamPriority(t *testing.T) {
 	sc := &serverConn{
-		roots:   newRoots(),
-		streams: make(map[uint32]*stream),
+		roots:                 newRoots(),
+		streams:               make(map[uint32]*stream),
+		serveG:                newGoroutineLock(),
+		maxDependencyTree:     defaultMaxDependencyTree,
+		maxSavedClosedStreams: defaultMaxSavedClosedStreams,
+		maxSavedIdleStreams:   defaultMaxSavedIdleStreams,
 	}
 
 	/*  Initial dependency:
@@ -866,7 +894,7 @@ func TestCreateStreamPriority(t *testing.T) {
 			depNext:   b,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(b),
 			n:         2,
 		},
@@ -909,7 +937,7 @@ func TestCreateStreamPriority(t *testing.T) {
 			depNext:   c,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(c, b),
 			n:         3,
 		},
@@ -945,7 +973,7 @@ func TestCreateStreamPriority(t *testing.T) {
 	 */
 
 	d, _ := newStream(7, sc, PriorityParam{
-		Weight:    defaultWeight,
+		Weight:    defaultWeight - 1,
 		StreamDep: 3,
 	})
 	e, _ := newStream(9, sc, PriorityParam{
@@ -954,11 +982,11 @@ func TestCreateStreamPriority(t *testing.T) {
 	})
 	f, _ := newStream(11, sc, PriorityParam{
 		StreamDep: 3,
-		Weight:    defaultWeight,
+		Weight:    defaultWeight - 1,
 	})
 	g, _ := newStream(13, sc, PriorityParam{
 		StreamDep: 1,
-		Weight:    defaultWeight,
+		Weight:    defaultWeight - 1,
 	})
 
 	testRoots(t, rootTest{
@@ -976,7 +1004,7 @@ func TestCreateStreamPriority(t *testing.T) {
 			depNext:   g,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(g, c, b),
 			n:         7,
 		},
@@ -1006,7 +1034,7 @@ func TestCreateStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   f,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1026,7 +1054,7 @@ func TestCreateStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   d,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1036,7 +1064,7 @@ func TestCreateStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   c,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1074,7 +1102,7 @@ func TestCreateStreamPriority(t *testing.T) {
 			depNext:   g,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(g, c, b),
 			n:         8,
 		},
@@ -1094,7 +1122,7 @@ func TestCreateStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   d,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1110,7 +1138,8 @@ func TestCreateStreamPriority(t *testing.T) {
 		},
 	})
 
-	/* Create a root stream h(17) and then create a stream i(19) with exclusive dependency on 0
+	/* Create a root stream h(17) and then create a stream i(19) with exclusive
+	 * dependency on 0
 	 *
 	 *       __i(19)__
 	 *      /         \
@@ -1155,7 +1184,7 @@ func TestCreateStreamPriority(t *testing.T) {
 			depNext:   g,
 			sibPrev:   h,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(g, c, b),
 			n:         8,
 		},
@@ -1185,7 +1214,7 @@ func TestCreateStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   f,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1205,7 +1234,7 @@ func TestCreateStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   d,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1225,7 +1254,7 @@ func TestCreateStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   c,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1235,7 +1264,7 @@ func TestCreateStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   a,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1273,12 +1302,12 @@ func TestCreateStreamPriority(t *testing.T) {
 
 	l, _ := newStream(25, sc, PriorityParam{
 		StreamDep: 23,
-		Weight:    defaultWeight,
+		Weight:    defaultWeight - 1,
 	})
 
 	m, _ := newStream(27, sc, PriorityParam{
 		StreamDep: 21,
-		Weight:    defaultWeight,
+		Weight:    defaultWeight - 1,
 	})
 
 	// intermediate state for roots before Exclusive on 0
@@ -1293,7 +1322,7 @@ func TestCreateStreamPriority(t *testing.T) {
 	n, _ := newStream(29, sc, PriorityParam{
 		StreamDep: 0,
 		Exclusive: true,
-		Weight:    defaultWeight,
+		Weight:    defaultWeight - 1,
 	})
 
 	testRoots(t, rootTest{
@@ -1321,7 +1350,7 @@ func TestCreateStreamPriority(t *testing.T) {
 			depNext:   m,
 			sibPrev:   k,
 			sibNext:   i,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(m),
 			n:         2,
 		},
@@ -1331,7 +1360,7 @@ func TestCreateStreamPriority(t *testing.T) {
 			depNext:   l,
 			sibPrev:   nil,
 			sibNext:   z,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(l),
 			n:         2,
 		},
@@ -1341,7 +1370,7 @@ func TestCreateStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1351,7 +1380,7 @@ func TestCreateStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1361,7 +1390,7 @@ func TestCreateStreamPriority(t *testing.T) {
 			depNext:   k,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(i, z, k),
 			n:         15,
 		},
@@ -1369,10 +1398,24 @@ func TestCreateStreamPriority(t *testing.T) {
 
 }
 
+/*
+ * Tests Adjust Stream Priority
+ * =============================
+ *
+ * - update roots
+ * - update weightSum
+ * - update depPrev, depNext, sibPrev, sibNext
+ * - num of streams in dependency tree
+ */
+
 func TestAdjustStreamPriority(t *testing.T) {
 	sc := &serverConn{
-		roots:   newRoots(),
-		streams: make(map[uint32]*stream),
+		roots:                 newRoots(),
+		streams:               make(map[uint32]*stream),
+		serveG:                newGoroutineLock(),
+		maxDependencyTree:     defaultMaxDependencyTree,
+		maxSavedClosedStreams: defaultMaxSavedClosedStreams,
+		maxSavedIdleStreams:   defaultMaxSavedIdleStreams,
 	}
 
 	/*  Initial dependency
@@ -1408,11 +1451,11 @@ func TestAdjustStreamPriority(t *testing.T) {
 	 *
 	 */
 
-	d.adjustStreamPriority(PriorityParam{
+	d.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 1,
-		Weight:    defaultWeight,
+		Weight:    defaultWeight - 1,
 	})
-	e.adjustStreamPriority(PriorityParam{
+	e.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 5,
 		Weight:    255,
 	})
@@ -1432,7 +1475,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   d,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(d),
 			n:         2,
 		},
@@ -1442,7 +1485,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1462,7 +1505,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1517,29 +1560,29 @@ func TestAdjustStreamPriority(t *testing.T) {
 	 *      b(3) h(15)
 	 */
 
-	f.adjustStreamPriority(PriorityParam{
+	f.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 5,
 		Weight:    21,
 	})
-	i.adjustStreamPriority(PriorityParam{
+	i.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 13,
-		Weight:    defaultWeight,
+		Weight:    defaultWeight - 1,
 	})
-	j.adjustStreamPriority(PriorityParam{
+	j.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 13,
 		Weight:    123,
 	})
-	k.adjustStreamPriority(PriorityParam{
+	k.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 13,
 		Weight:    72,
 	})
-	h.adjustStreamPriority(PriorityParam{
+	h.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 21,
-		Weight:    defaultWeight,
+		Weight:    defaultWeight - 1,
 	})
-	b.adjustStreamPriority(PriorityParam{
+	b.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 21,
-		Weight:    defaultWeight,
+		Weight:    defaultWeight - 1,
 	})
 
 	testRoots(t, rootTest{
@@ -1557,7 +1600,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   d,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(d),
 			n:         2,
 		},
@@ -1567,7 +1610,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   h,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1587,7 +1630,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1627,7 +1670,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   b,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1637,7 +1680,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   j,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1674,11 +1717,11 @@ func TestAdjustStreamPriority(t *testing.T) {
 	 *     d(7) b(3) h(15)
 	 */
 
-	k.adjustStreamPriority(PriorityParam{
+	k.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 19,
-		Weight:    defaultWeight,
+		Weight:    defaultWeight - 1,
 	})
-	a.adjustStreamPriority(PriorityParam{
+	a.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 19,
 		Weight:    12,
 	})
@@ -1708,7 +1751,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   h,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1728,7 +1771,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1768,7 +1811,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   b,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1778,7 +1821,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   j,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1798,7 +1841,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   b,
 			sibPrev:   a,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(b, h),
 			n:         3,
 		},
@@ -1819,11 +1862,11 @@ func TestAdjustStreamPriority(t *testing.T) {
 	 *                      f(11)  e(9)
 	 */
 
-	i.adjustStreamPriority(PriorityParam{
+	i.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 21,
 		Weight:    1,
 	})
-	c.adjustStreamPriority(PriorityParam{
+	c.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 15,
 		Weight:    20,
 	})
@@ -1853,7 +1896,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   i,
 			sibNext:   h,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1873,7 +1916,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -1913,7 +1956,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   c,
 			sibPrev:   b,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(c),
 			n:         4,
 		},
@@ -1943,7 +1986,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   i,
 			sibPrev:   a,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(i, b, h),
 			n:         7,
 		},
@@ -1995,7 +2038,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	 *                                     f(11)  e(9)
 	 */
 
-	m.adjustStreamPriority(PriorityParam{
+	m.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 19,
 		Exclusive: true,
 		Weight:    183,
@@ -2026,7 +2069,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   i,
 			sibNext:   h,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -2046,7 +2089,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -2086,7 +2129,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   c,
 			sibPrev:   b,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(c),
 			n:         4,
 		},
@@ -2116,7 +2159,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   i,
 			sibPrev:   a,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(i, b, h),
 			n:         7,
 		},
@@ -2152,19 +2195,19 @@ func TestAdjustStreamPriority(t *testing.T) {
 	 *                             f(11)  e(9)
 	 */
 
-	l.adjustStreamPriority(PriorityParam{
+	l.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 31,
 		Weight:    20,
 	})
-	n.adjustStreamPriority(PriorityParam{
+	n.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 31,
-		Weight:    defaultWeight,
+		Weight:    defaultWeight - 1,
 	})
-	o.adjustStreamPriority(PriorityParam{
+	o.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 31,
 		Weight:    42,
 	})
-	p.adjustStreamPriority(PriorityParam{
+	p.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 21,
 		Exclusive: true,
 		Weight:    200,
@@ -2195,7 +2238,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   i,
 			sibNext:   h,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -2215,7 +2258,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -2255,7 +2298,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   c,
 			sibPrev:   b,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(c),
 			n:         4,
 		},
@@ -2285,7 +2328,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   p,
 			sibPrev:   a,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(p),
 			n:         11,
 		},
@@ -2315,7 +2358,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   o,
 			sibNext:   l,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -2389,7 +2432,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 		n:         22,
 	})
 
-	a1.adjustStreamPriority(PriorityParam{
+	a1.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 111,
 		Exclusive: true,
 		Weight:    200,
@@ -2420,7 +2463,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   f1,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(f1),
 			n:         6,
 		},
@@ -2520,7 +2563,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	 *
 	 */
 
-	h.adjustStreamPriority(PriorityParam{
+	h.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 5,
 		Weight:    254,
 	})
@@ -2550,7 +2593,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   i,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -2570,7 +2613,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -2640,7 +2683,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   p,
 			sibPrev:   a,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(p),
 			n:         11,
 		},
@@ -2670,7 +2713,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   o,
 			sibNext:   l,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -2744,7 +2787,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	 *
 	 */
 
-	m.adjustStreamPriority(PriorityParam{
+	m.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 31,
 		Weight:    111,
 	})
@@ -2766,7 +2809,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   i,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -2786,7 +2829,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -2856,7 +2899,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   a,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -2886,7 +2929,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   o,
 			sibNext:   l,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -2912,7 +2955,8 @@ func TestAdjustStreamPriority(t *testing.T) {
 		},
 	})
 
-	/* Reprioritize dependency to dependent on own dependency with exclusive flag: j(19) to c(5)
+	/* Reprioritize dependency to dependent on own dependency with exclusive
+	 * flag: j(19) to c(5)
 	 *
 	 * From:
 	 *                                    g(13)
@@ -2959,10 +3003,10 @@ func TestAdjustStreamPriority(t *testing.T) {
 	 *  d(7)
 	 */
 
-	j.adjustStreamPriority(PriorityParam{
+	j.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 5,
 		Exclusive: true,
-		Weight:    defaultWeight,
+		Weight:    defaultWeight - 1,
 	})
 
 	testStreamNode(t, []streamTest{
@@ -2982,7 +3026,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   i,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -3002,7 +3046,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -3062,7 +3106,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   p,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(p, h, f, e),
 			n:         14,
 		},
@@ -3072,7 +3116,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   a,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -3102,7 +3146,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   o,
 			sibNext:   l,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -3180,7 +3224,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	 *  d(7)
 	 */
 
-	g.adjustStreamPriority(PriorityParam{
+	g.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 11,
 		Weight:    212,
 	})
@@ -3210,7 +3254,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   i,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -3230,7 +3274,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -3290,7 +3334,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   p,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(p, h, e),
 			n:         13,
 		},
@@ -3300,7 +3344,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   a,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -3330,7 +3374,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   o,
 			sibNext:   l,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -3408,7 +3452,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	 *           o(29) n(27) l(23) i(17) b(3)
 	 */
 
-	f.adjustStreamPriority(PriorityParam{
+	f.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 25,
 		Weight:    99,
 	})
@@ -3438,7 +3482,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   i,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -3458,7 +3502,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -3518,7 +3562,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   p,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(p, h, e),
 			n:         9,
 		},
@@ -3528,7 +3572,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   a,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -3558,7 +3602,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   o,
 			sibNext:   l,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -3584,7 +3628,8 @@ func TestAdjustStreamPriority(t *testing.T) {
 		},
 	})
 
-	/* Reprioritize dependency to dependent on own dependency with exclusive flag: m(25) to h(15)
+	/* Reprioritize dependency to dependent on own dependency with exclusive
+	 * flag: m(25) to h(15)
 	 *
 	 * From:
 	 *
@@ -3637,7 +3682,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	 *         o(29) n(27) l(23) i(17)  b(3)
 	 */
 
-	m.adjustStreamPriority(PriorityParam{
+	m.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 15,
 		Weight:    33,
 		Exclusive: true,
@@ -3668,7 +3713,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   i,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -3688,7 +3733,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -3748,7 +3793,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   p,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(p, e),
 			n:         8,
 		},
@@ -3758,7 +3803,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   a,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -3788,7 +3833,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   o,
 			sibNext:   l,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -3814,7 +3859,8 @@ func TestAdjustStreamPriority(t *testing.T) {
 		},
 	})
 
-	/* Reprioritize dependency to dependent on own dependency with exclusive flag: h(15) to j(19)
+	/* Reprioritize dependency to dependent on own dependency with exclusive
+	 * flag: h(15) to j(19)
 	 *
 	 * From:
 	 *
@@ -3861,7 +3907,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	 *  c(5)
 	 */
 
-	h.adjustStreamPriority(PriorityParam{
+	h.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 19,
 		Weight:    31,
 		Exclusive: true,
@@ -3892,7 +3938,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   i,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -3912,7 +3958,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -3972,7 +4018,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   h,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(h),
 			n:         16,
 		},
@@ -3982,7 +4028,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   a,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -4012,7 +4058,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   o,
 			sibNext:   l,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -4068,7 +4114,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	 *
 	 */
 
-	c.adjustStreamPriority(PriorityParam{
+	c.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 0,
 		Weight:    231,
 	})
@@ -4098,7 +4144,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   i,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -4118,7 +4164,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -4178,7 +4224,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   h,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(h),
 			n:         15,
 		},
@@ -4188,7 +4234,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   a,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -4218,7 +4264,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   o,
 			sibNext:   l,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -4271,7 +4317,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 	 *
 	 */
 
-	m.adjustStreamPriority(PriorityParam{
+	m.adjustStreamPriority(sc, PriorityParam{
 		StreamDep: 0,
 		Exclusive: true,
 		Weight:    67,
@@ -4302,7 +4348,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   i,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -4322,7 +4368,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   nil,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -4382,7 +4428,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   h,
 			sibPrev:   c,
 			sibNext:   b1,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(h),
 			n:         9,
 		},
@@ -4392,7 +4438,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   a,
 			sibNext:   nil,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -4422,7 +4468,7 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   nil,
 			sibPrev:   o,
 			sibNext:   l,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: 0,
 			n:         1,
 		},
@@ -4452,12 +4498,21 @@ func TestAdjustStreamPriority(t *testing.T) {
 			depNext:   f1,
 			sibPrev:   j,
 			sibNext:   f,
-			weight:    defaultWeight,
+			weight:    defaultWeight - 1,
 			weightSum: sumWeight(f1),
 			n:         6,
 		},
 	})
 }
+
+/*
+ * Tests dependcy tree on add DATA to scheduler
+ * ============================================
+ *
+ * - update dependency tree state depState
+ * - update weightSumTop
+ * - update weightEff
+ */
 
 type streamDataTest struct {
 	st           *stream
@@ -4466,7 +4521,7 @@ type streamDataTest struct {
 	weightEff    int32
 }
 
-func testDataAddStream(t *testing.T, streamDataTests []streamDataTest) {
+func testSetDepStateReady(t *testing.T, streamDataTests []streamDataTest) {
 	for _, s := range streamDataTests {
 		_, file, line, _ := runtime.Caller(1)
 		if s.st.depState != s.depState {
@@ -4490,11 +4545,15 @@ func testDataAddStream(t *testing.T, streamDataTests []streamDataTest) {
 	}
 }
 
-func TestDataAddStream(t *testing.T) {
+func TestSetDepStateReady(t *testing.T) {
 	sc := &serverConn{
-		roots:             newRoots(),
-		streams:           make(map[uint32]*stream),
-		initialWindowSize: initialWindowSize,
+		roots:                 newRoots(),
+		streams:               make(map[uint32]*stream),
+		serveG:                newGoroutineLock(),
+		maxDependencyTree:     defaultMaxDependencyTree,
+		maxSavedClosedStreams: defaultMaxSavedClosedStreams,
+		maxSavedIdleStreams:   defaultMaxSavedIdleStreams,
+		initialWindowSize:     initialWindowSize,
 	}
 	sc.flow.add(initialWindowSize)
 	sc.inflow.add(initialWindowSize)
@@ -4558,7 +4617,7 @@ func TestDataAddStream(t *testing.T) {
 		stream: m,
 	})
 
-	testDataAddStream(t, []streamDataTest{
+	testSetDepStateReady(t, []streamDataTest{
 		streamDataTest{
 			st:           a,
 			depState:     depStateIdle,
@@ -4581,13 +4640,13 @@ func TestDataAddStream(t *testing.T) {
 			st:           h,
 			depState:     depStateIdle,
 			weightSumTop: sumWeight(i, g),
-			weightEff:    3,
+			weightEff:    4,
 		},
 		streamDataTest{
 			st:           i,
 			depState:     depStateTop,
 			weightSumTop: 0,
-			weightEff:    2,
+			weightEff:    3,
 		},
 		streamDataTest{
 			st:           j,
@@ -4608,5 +4667,19 @@ func TestDataAddStream(t *testing.T) {
 			weightEff:    sumWeight(m),
 		},
 	})
-
 }
+
+/*
+ * Tests dependcy tree scheduler
+ * =============================
+ */
+
+/*
+ * Tests dependcy tree on creating idle priority streams
+ * =====================================================
+ */
+
+/*
+ * Tests dependcy tree on retain closed streams and repriotize closed
+ * ==================================================================
+ */
