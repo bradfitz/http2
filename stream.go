@@ -168,9 +168,15 @@ func newStream(id uint32, sc *serverConn, priority PriorityParam) (*stream, erro
 	sc.serveG.check()
 
 	if state, st := sc.state(id); state == stateIdle && st != nil {
-		// creating stream that alredy created by priority frame
+		// creating stream that has been alredy created by priority frame
 		// see "5.3.4 Prioritization State Management" for details.
 		sc.removeIdle(st.idleElem)
+	}
+
+	if sc.clientInitiated(id) && id > sc.maxStreamID {
+		sc.maxStreamID = id
+	} else if !sc.clientInitiated(id) && id > sc.maxPushID {
+		sc.maxPushID = id
 	}
 
 	st := &stream{
@@ -197,7 +203,7 @@ func newStream(id uint32, sc *serverConn, priority PriorityParam) (*stream, erro
 
 // for debugging only:
 func (st *stream) String() string {
-	return fmt.Sprintf("[stream stream=%d weight=%d weightSum=%d weightEff=%d]", st.id, st.weight, st.weightSum, st.weightEff)
+	return fmt.Sprintf("[stream stream=%d state=%s weight=%d weightEff=%d]", st.id, st.state, st.weight, st.weightEff)
 }
 
 func (st *stream) addRoots() {
@@ -215,8 +221,7 @@ func (st *stream) removeRoots() {
 func (st *stream) setState(sc *serverConn, state streamState) {
 	switch state {
 	case stateIdle:
-		// create idle stream on dependency tree as a grouping node for
-		// priority purposes.
+		// create idle stream as a grouping node for priority purposes
 		st.idleElem = sc.idles.PushFront(st)
 		// recycle old
 		for sc.idles.Len() > sc.maxSavedIdleStreams {
@@ -267,19 +272,15 @@ func (st *stream) createStreamPriority(sc *serverConn, priority PriorityParam) e
 		}
 		if parent == nil && state == stateIdle {
 			// Priority on a idle parent stream
-			//
 			// 5.3.4 Prioritization State Management
 			// ... streams that are in the "idle" state can be assigned priority
 			// or become a parent of other streams. This allows for the creation
 			// of a grouping node in the dependency tree, which enables more
 			// flexible expressions of priority. Idle streams begin with a
 			// default priority (Section 5.3.5)
-			if parentID%2 != 1 {
-				// trying to create idle anchor on pushed ids
+			if !sc.clientInitiated(parentID) {
+				// trying to create grouping node with pushed id
 				return nil
-			}
-			if parentID > sc.maxStreamID {
-				sc.maxStreamID = parentID
 			}
 			parent, err = newStream(parentID, sc, defaultPriority)
 			if err != nil {
@@ -297,7 +298,6 @@ func (st *stream) createStreamPriority(sc *serverConn, priority PriorityParam) e
 			// nothing to do here
 			return nil
 		}
-		// TODO (brk0v) test this
 		root := st.getRoot()
 		if root.n < sc.maxDependencyTree {
 			if priority.Exclusive {
@@ -346,19 +346,15 @@ func (st *stream) adjustStreamPriority(sc *serverConn, priority PriorityParam) e
 		}
 		if parent == nil && state == stateIdle {
 			// Priority on a idle parent stream
-			//
 			// 5.3.4 Prioritization State Management
 			// ... streams that are in the "idle" state can be assigned priority
 			// or become a parent of other streams. This allows for the creation
 			// of a grouping node in the dependency tree, which enables more
 			// flexible expressions of priority. Idle streams begin with a
 			// default priority (Section 5.3.5)
-			if parentID%2 != 1 {
-				// trying to create idle anchor on pushed ids
+			if !sc.clientInitiated(parentID) {
+				// trying to create grouping node with pushed id
 				return nil
-			}
-			if parentID > sc.maxStreamID {
-				sc.maxStreamID = parentID
 			}
 			parent, err = newStream(parentID, sc, defaultPriority)
 			if err != nil {

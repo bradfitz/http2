@@ -60,10 +60,11 @@ import (
 )
 
 const (
-	prefaceTimeout        = 10 * time.Second
-	firstSettingsTimeout  = 2 * time.Second // should be in-flight with preface anyway
-	handlerChunkWriteSize = 4 << 10
-	defaultMaxStreams     = 250 // TODO: make this 100 as the GFE seems to?
+	prefaceTimeout          = 10 * time.Second
+	firstSettingsTimeout    = 2 * time.Second // should be in-flight with preface anyway
+	handlerChunkWriteSize   = 4 << 10
+	defaultMaxStreams       = 250 // TODO: make this 100 as the GFE seems to?
+	defaultClientMaxStreams = 100 // default http://http2.github.io/http2-spec/#SettingValues
 )
 
 var (
@@ -253,6 +254,8 @@ func (srv *Server) handleConn(hs *http.Server, c net.Conn, h http.Handler) {
 		maxSavedIdleStreams:   srv.maxSavedIdleStreams(),
 		closeds:               list.New(),
 		maxSavedClosedStreams: srv.maxSavedClosedStreams(),
+		maxPushID:             2,
+		clientMaxStreams:      defaultClientMaxStreams,
 	}
 	sc.flow.add(initialWindowSize)
 	sc.inflow.add(initialWindowSize)
@@ -387,7 +390,9 @@ type serverConn struct {
 	clientMaxStreams      uint32 // SETTINGS_MAX_CONCURRENT_STREAMS from client (our PUSH_PROMISE limit)
 	advMaxStreams         uint32 // our SETTINGS_MAX_CONCURRENT_STREAMS advertised the client
 	curOpenStreams        uint32 // client's number of open streams
+	curOpenPushStreams    uint32 // number of open streams initiated by server (PUSH)
 	maxStreamID           uint32 // max ever seen
+	maxPushID             uint32 // maxID used for push
 	streams               map[uint32]*stream
 	initialWindowSize     int32
 	headerTableSize       uint32
@@ -446,9 +451,12 @@ func (sc *serverConn) state(streamID uint32) (streamState, *stream) {
 	// a client sends a HEADERS frame on stream 7 without ever sending a
 	// frame on stream 5, then stream 5 transitions to the "closed"
 	// state when the first frame for stream 7 is sent or received."
-	if streamID <= sc.maxStreamID {
+	if sc.clientInitiated(streamID) && streamID <= sc.maxStreamID {
+		return stateClosed, nil
+	} else if !sc.clientInitiated(streamID) && streamID <= sc.maxPushID {
 		return stateClosed, nil
 	}
+
 	return stateIdle, nil
 }
 
@@ -1088,8 +1096,22 @@ func (sc *serverConn) closeStream(st *stream, err error) {
 		panic(fmt.Sprintf("invariant; can't close stream in state %v", st.state))
 	}
 
+	if !sc.clientInitiated(st.id) && st.state != stateResvLocal {
+		// push streams in stateResvLocal don't increase counter curOpenPushStreams
+		// http://http2.github.io/http2-spec/#rfc.section.5.1.2
+		// Streams that are in the "open" state, or either of the "half closed"
+		// states count toward the maximum number of streams that an endpoint is
+		// permitted to open. Streams in any of these three states count toward
+		// the limit advertised in the SETTINGS_MAX_CONCURRENT_STREAMS setting.
+		// Streams in either of the "reserved" states do not count toward the
+		// stream limit.
+		sc.curOpenPushStreams--
+	} else {
+		sc.curOpenStreams--
+	}
+
+	// TODO (brk0v): don't retain push streams
 	st.setState(sc, stateClosed)
-	sc.curOpenStreams--
 
 	if p := st.body; p != nil {
 		p.Close(err)
@@ -1209,6 +1231,10 @@ func (sc *serverConn) processData(f *DataFrame) error {
 		// more DATA.
 		return StreamError{id, ErrCodeStreamClosed}
 	}
+	if !sc.clientInitiated(id) {
+		// Receiving data frame on a push stream.
+		return ConnectionError(ErrCodeProtocol)
+	}
 	if st.body == nil {
 		panic("internal error: should have a body in this state")
 	}
@@ -1246,6 +1272,15 @@ func (sc *serverConn) processData(f *DataFrame) error {
 	return nil
 }
 
+func (sc *serverConn) clientInitiated(id uint32) bool {
+	if id%2 == 1 {
+		// client initiated
+		return true
+	}
+	// push stream id
+	return false
+}
+
 func (sc *serverConn) processHeaders(f *HeadersFrame) error {
 	sc.serveG.check()
 	id := f.Header().StreamID
@@ -1253,8 +1288,13 @@ func (sc *serverConn) processHeaders(f *HeadersFrame) error {
 		// Ignore.
 		return nil
 	}
-	// http://http2.github.io/http2-spec/#rfc.section.5.1.1
-	if id%2 != 1 || id <= sc.maxStreamID || sc.req.stream != nil {
+
+	// Checking stream state.
+	// Keep in mind that there can be already created idle streams for groupping
+	// purpoces (see 5.3.4 Prioritization State Management)
+	state, _ := sc.state(id)
+	if !sc.clientInitiated(id) || state != stateIdle || sc.req.stream != nil {
+		// http://http2.github.io/http2-spec/#rfc.section.5.1.1
 		// Streams initiated by a client MUST use odd-numbered
 		// stream identifiers. [...] The identifier of a newly
 		// established stream MUST be numerically greater than all
@@ -1263,9 +1303,6 @@ func (sc *serverConn) processHeaders(f *HeadersFrame) error {
 		// stream identifier MUST respond with a connection error
 		// (Section 5.4.1) of type PROTOCOL_ERROR.
 		return ConnectionError(ErrCodeProtocol)
-	}
-	if id > sc.maxStreamID {
-		sc.maxStreamID = id
 	}
 
 	priority := defaultPriority
@@ -1353,7 +1390,6 @@ func (sc *serverConn) processPriority(f *PriorityFrame) error {
 	state, st := sc.state(f.StreamID)
 	if st == nil && state == stateIdle {
 		// Priority on a idle parent stream
-		//
 		// 5.3.4 Prioritization State Management
 		// ... streams that are in the "idle" state can be assigned priority
 		// or become a parent of other streams. This allows for the creation
@@ -1361,15 +1397,11 @@ func (sc *serverConn) processPriority(f *PriorityFrame) error {
 		// flexible expressions of priority. Idle streams begin with a
 		// default priority (Section 5.3.5)
 		id := f.StreamID
-		if id%2 != 1 {
-			// trying to create idle anchor on pushed ids
+		if !sc.clientInitiated(id) {
+			// trying to create grouping node with pushed id
 			return nil
 		}
-		if id > sc.maxStreamID {
-			sc.maxStreamID = id
-		}
 		st, err := newStream(id, sc, f.PriorityParam)
-		fmt.Println(f.PriorityParam)
 		if err != nil {
 			return err
 		}
@@ -1496,6 +1528,12 @@ func (sc *serverConn) writeHeaders(st *stream, headerData *writeResHeaders, temp
 		// mutates it.
 		errc = tempCh
 	}
+
+	if !sc.clientInitiated(st.id) {
+		// transit state for push promise
+		st.state = stateHalfClosedRemote
+	}
+
 	sc.writeFrameFromHandler(frameWriteMsg{
 		write:  headerData,
 		stream: st,
