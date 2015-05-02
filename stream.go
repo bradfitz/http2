@@ -61,7 +61,10 @@ var depStateName = [...]string{
 }
 
 func (ds streamDepState) String() string {
-	return depStateName[ds]
+	if 0 <= ds && ds < streamDepState(len(depStateName)) {
+		return depStateName[ds]
+	}
+	return fmt.Sprintf("http2: unknown streamDepState %d", ds)
 }
 
 // roots is a list of connection's root streams.
