@@ -87,10 +87,15 @@ func (r *roots) move(st *stream) {
 // remove removes stream but doesn't decrement n.
 func (r *roots) remove(st *stream) {
 	r.Remove(st.rootElem)
+	st.rootElem = nil
 }
 
 // removeAll removes all streams but doesn't flush n.
 func (r *roots) removeAll() {
+	for r.Len() != 0 {
+		rootStream := r.Back().Value.(*stream)
+		r.remove(rootStream)
+	}
 	r.Init()
 }
 
@@ -206,6 +211,11 @@ func (st *stream) String() string {
 	return fmt.Sprintf("[stream stream=%d state=%s weight=%d weightEff=%d]", st.id, st.state, st.weight, st.weightEff)
 }
 
+func (st *stream) destroyStream(sc *serverConn) {
+	delete(sc.streams, st.id)
+	st.removeDependent()
+}
+
 func (st *stream) addRoots() {
 	st.roots.add(st)
 }
@@ -228,6 +238,11 @@ func (st *stream) setState(sc *serverConn, state streamState) {
 			sc.removeIdle(sc.idles.Back())
 		}
 	case stateClosed:
+		// if stream is push don't retain
+		if !sc.clientInitiated(st.id) {
+			st.destroyStream(sc)
+			return
+		}
 		// 5.3.4 Prioritization State Management
 		//... an endpoint SHOULD retain stream prioritization state for a period
 		// after streams become closed. The longer state is retained, the lower
@@ -238,6 +253,7 @@ func (st *stream) setState(sc *serverConn, state streamState) {
 		for sc.closeds.Len() > sc.maxSavedClosedStreams {
 			sc.removeClosed(sc.closeds.Back())
 		}
+
 	}
 
 	st.state = state
@@ -498,11 +514,6 @@ func (st *stream) insertDependentSubTree(chst *stream) {
 	root.updateWeightSumTop()
 	root.updateWeightEff()
 }
-
-/*func (st *stream) closeStream() {
-	st.setDepStateIdle()
-	st.removeDependent()
-}*/
 
 func (st *stream) removeDependent() {
 	var root *stream

@@ -606,7 +606,6 @@ func (sc *serverConn) closeAllStreamsOnConnClose() {
 	for sc.closeds.Len() != 0 {
 		sc.removeClosed(sc.closeds.Back())
 	}
-
 }
 
 func (sc *serverConn) stopShutdownTimer() {
@@ -1110,7 +1109,6 @@ func (sc *serverConn) closeStream(st *stream, err error) {
 		sc.curOpenStreams--
 	}
 
-	// TODO (brk0v): don't retain push streams
 	st.setState(sc, stateClosed)
 
 	if p := st.body; p != nil {
@@ -1125,18 +1123,15 @@ func (sc *serverConn) closeStream(st *stream, err error) {
 
 func (sc *serverConn) removeIdle(idleElem *list.Element) {
 	idleStream := idleElem.Value.(*stream)
-	// idle stream don't have cw or entry in writeSched
-	// so just delete it from streams and from dependency tree
-	delete(sc.streams, idleStream.id)
-	// we don't need to call setDepStateIdle() becuase we was idle
-	idleStream.removeDependent()
+	idleStream.destroyStream(sc)
+	idleStream.idleElem = nil
 	sc.idles.Remove(idleElem)
 }
 
 func (sc *serverConn) removeClosed(closedElem *list.Element) {
 	closedStream := closedElem.Value.(*stream)
-	delete(sc.streams, closedStream.id)
-	closedStream.removeDependent()
+	closedStream.destroyStream(sc)
+	closedStream.closedElem = nil
 	sc.closeds.Remove(closedElem)
 }
 
