@@ -540,13 +540,14 @@ func TestWriteGoAway(t *testing.T) {
 }
 
 func TestWritePushPromise(t *testing.T) {
-	pp := PushPromiseParam{
+	pp := HeadersFrameParam{
+		PushPromise:   true,
 		StreamID:      42,
 		PromiseID:     42,
 		BlockFragment: []byte("abc"),
 	}
 	fr, buf := testFramer()
-	if err := fr.WritePushPromise(pp); err != nil {
+	if err := fr.WriteHeaders(pp); err != nil {
 		t.Fatal(err)
 	}
 	const wantEnc = "\x00\x00\x07\x05\x00\x00\x00\x00*\x00\x00\x00*abc"

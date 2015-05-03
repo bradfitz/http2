@@ -287,6 +287,17 @@ func newGopherTilesHandler() http.Handler {
 				return
 			}
 		}
+		cacheBust := time.Now().UnixNano()
+
+		if p, ok := w.(http2.Pusher); ok {
+			for y := 0; y < yt; y++ {
+				for x := 0; x < xt; x++ {
+					path := fmt.Sprintf("/gophertiles?x=%d&y=%d&cachebust=%d&latency=%d", x, y, cacheBust, ms)
+					p.Push("GET", path, nil)
+				}
+			}
+		}
+
 		io.WriteString(w, "<html><body>")
 		fmt.Fprintf(w, "A grid of %d tiled images is below. Compare:<p>", xt*yt)
 		for _, ms := range []int{0, 30, 200, 1000} {
@@ -297,7 +308,6 @@ func newGopherTilesHandler() http.Handler {
 			)
 		}
 		io.WriteString(w, "<p>\n")
-		cacheBust := time.Now().UnixNano()
 		for y := 0; y < yt; y++ {
 			for x := 0; x < xt; x++ {
 				fmt.Fprintf(w, "<img width=%d height=%d src='/gophertiles?x=%d&y=%d&cachebust=%d&latency=%d'>",
