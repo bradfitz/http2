@@ -116,11 +116,10 @@ type stream struct {
 	cw   closeWaiter // closed wait stream transitions to closed state
 
 	// owned by serverConn's serve loop:
-	bodyBytes     int64   // body bytes seen so far
-	declBodyBytes int64   // or -1 if undeclared
-	flow          flow    // limits writing from Handler to client
-	inflow        flow    // what the client is allowed to POST/etc to us
-	parent        *stream // or nil
+	bodyBytes     int64 // body bytes seen so far
+	declBodyBytes int64 // or -1 if undeclared
+	flow          flow  // limits writing from Handler to client
+	inflow        flow  // what the client is allowed to POST/etc to us
 	weight        int32
 	state         streamState
 	sentReset     bool // only true once detached from streams map
@@ -211,12 +210,11 @@ func newStream(id uint32, sc *serverConn, priority PriorityParam) (*stream, erro
 
 // for debugging only:
 func (st *stream) String() string {
-	return fmt.Sprintf("[stream stream=%d state=%s weight=%d weightEff=%d]", st.id, st.state, st.weight, st.weightEff)
-}
-
-func (st *stream) destroyStream(sc *serverConn) {
-	delete(sc.streams, st.id)
-	st.removeDependent()
+	var parentID uint32 = 0
+	if parent := st.parent(); parent != nil {
+		parentID = parent.id
+	}
+	return fmt.Sprintf("[stream id=%d parent=%d state=%s weight=%d weightEff=%d]", st.id, parentID, st.state, st.weight, st.weightEff)
 }
 
 func (st *stream) addRoots() {
@@ -232,6 +230,7 @@ func (st *stream) removeRoots() {
 }
 
 func (st *stream) setState(sc *serverConn, state streamState) {
+	sc.serveG.check()
 	switch state {
 	case stateIdle:
 		// create idle stream as a grouping node for priority purposes
@@ -243,6 +242,7 @@ func (st *stream) setState(sc *serverConn, state streamState) {
 	case stateClosed:
 		// if stream is push don't retain
 		if !sc.clientInitiated(st.id) {
+			st.state = stateClosed
 			st.destroyStream(sc)
 			return
 		}
@@ -260,6 +260,11 @@ func (st *stream) setState(sc *serverConn, state streamState) {
 	}
 
 	st.state = state
+}
+
+func (st *stream) destroyStream(sc *serverConn) {
+	st.removeDependent()
+	delete(sc.streams, st.id)
 }
 
 func (st *stream) createStreamPriority(sc *serverConn, priority PriorityParam) error {
@@ -724,6 +729,13 @@ func (st *stream) lastSib() (lsib *stream) {
 		lsib = s
 	}
 	return lsib
+}
+
+func (st *stream) parent() (parent *stream) {
+	for s := st; s != nil; s = s.sibPrev {
+		parent = s
+	}
+	return parent.depPrev
 }
 
 // updateNum updates number of total descendants on d size from stream to its

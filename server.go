@@ -1103,7 +1103,6 @@ func (sc *serverConn) processWindowUpdate(f *WindowUpdateFrame) error {
 
 func (sc *serverConn) processResetStream(f *RSTStreamFrame) error {
 	sc.serveG.check()
-
 	state, st := sc.state(f.StreamID)
 	if state == stateIdle {
 		// 6.4 "RST_STREAM frames MUST NOT be sent for a
@@ -1370,16 +1369,11 @@ func (sc *serverConn) startPushPromise(pp *pushPromise) {
 	// 5.3.5 Default Priorities
 	// Pushed streams (Section 8.2) initially depend on their associated stream.
 	// In both cases, streams are assigned a default weight of 16.
-	st := &stream{
-		id:     promiseid,
-		state:  stateResvLocal,
-		parent: pp.reqpm.stream,
-		weight: defaultWeight,
-	}
-	st.flow.conn = &sc.flow
-	st.flow.add(sc.initialWindowSize)
-	st.cw.Init()
-	sc.streams[promiseid] = st
+	// TODO (brk0v): check error here
+	st, _ := newStream(promiseid, sc, PriorityParam{
+		StreamDep: pp.reqpm.stream.id,
+		Weight:    defaultWeight - 1, // uint8
+	})
 
 	// TODO(dmorsing): figure out if priority is
 	// a factor between the initiating stream and
@@ -1404,6 +1398,8 @@ func (sc *serverConn) startPushPromise(pp *pushPromise) {
 		},
 		assocStream,
 		starthandlerCh})
+
+	st.setState(sc, stateResvLocal)
 
 	if sc.curOpenPushStreams >= sc.clientMaxStreams {
 		// http://http2.github.io/http2-spec/#PushResponses
@@ -1436,6 +1432,8 @@ func (sc *serverConn) startPushPromise(pp *pushPromise) {
 	// increment push counter on change state from reserved (local)
 	// TODO: (brk0v) mb increment right before sending frame?
 	sc.curOpenPushStreams++
+	st.setState(sc, stateHalfClosedRemote)
+
 	rw, req, err := sc.newWriterAndRequest(&pp.reqpm)
 	if err != nil {
 		panic("Created bad request for push")
@@ -1455,16 +1453,6 @@ func (sc *serverConn) startPushPromise(pp *pushPromise) {
 
 		sc.runHandler(rw, req)
 	}()
-}
-
-func (sc *serverConn) isPushStream(id uint32) bool {
-	if id == 0 {
-		panic("internal error: tring to check state of the stream with id: 0")
-	}
-	if id%2 == 0 {
-		return true
-	}
-	return false
 }
 
 func (sc *serverConn) processContinuation(f *ContinuationFrame) error {
@@ -1667,11 +1655,6 @@ func (sc *serverConn) writeHeaders(st *stream, headerData *writeResHeaders, temp
 		// writes out the correct value of keys, before a handler later potentially
 		// mutates it.
 		errc = tempCh
-	}
-
-	if !sc.clientInitiated(st.id) {
-		// transit state for push promise
-		st.state = stateHalfClosedRemote
 	}
 
 	sc.writeFrameFromHandler(frameWriteMsg{
