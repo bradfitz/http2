@@ -1121,7 +1121,7 @@ func (sc *serverConn) processResetStream(f *RSTStreamFrame) error {
 
 func (sc *serverConn) closeStream(st *stream, err error) {
 	sc.serveG.check()
-	if st.state == stateIdle {
+	if st.state == stateIdle || st.state == stateClosed {
 		panic(fmt.Sprintf("invariant; can't close stream in state %v", st.state))
 	}
 
