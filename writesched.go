@@ -8,6 +8,7 @@
 package http2
 
 import (
+	"errors"
 	"fmt"
 )
 
@@ -162,8 +163,16 @@ func (ws *writeScheduler) take() (wm frameWriteMsg, ok bool) {
 	}
 
 	for ws.canSend.len() > 0 {
-		q := ws.canSend.pop()
-		st := q.stream()
+		q, id := ws.canSend.pop()
+		st, err := q.stream()
+
+		// Checking for stale data in pq. There are two cases:
+		//  * writeQueue's s is niled because of forgetStream(). E.g. got RST;
+		//  * writeQueue has been reused from getEmptyQueue() with another one
+		//    stream id.
+		if err != nil || id != st.id {
+			continue
+		}
 
 		if st.depState != depStateTop {
 			// We have higher priority data to sent.
@@ -174,7 +183,7 @@ func (ws *writeScheduler) take() (wm frameWriteMsg, ok bool) {
 
 		// Check flow control
 		if n := ws.streamWritableBytes(q); n > 0 {
-			wm, ok = ws.takeFrom(q.streamID(), q)
+			wm, ok = ws.takeFrom(id, q)
 			if ok {
 				// update scheduler's last virt finish
 				ws.lvf += int32(wm.len()) * maxStreamWeight / st.weightEff
@@ -286,8 +295,10 @@ func (ws *writeScheduler) forgetStream(id uint32) {
 	for i := range q.s {
 		q.s[i] = frameWriteMsg{}
 	}
+	// drop to default
 	q.s = q.s[:0]
 	q.vf = 0
+	q.queued = false
 	ws.putEmptyQueue(q)
 }
 
@@ -299,7 +310,7 @@ type writeQueue struct {
 
 // for debugging only:
 func (q writeQueue) String() string {
-	return fmt.Sprintf("[writeQueue stream=%d, vf=%v]", q.stream().id, q.vf)
+	return fmt.Sprintf("[writeQueue stream=%d, vf=%v]", q.streamID(), q.vf)
 }
 
 func (q writeQueue) calcVirtFinish(w int32) int32 {
@@ -309,8 +320,13 @@ func (q writeQueue) calcVirtFinish(w int32) int32 {
 // streamID returns the stream ID for a non-empty stream-specific queue.
 func (q *writeQueue) streamID() uint32 { return q.s[0].stream.id }
 
-// stream returns the stream for a non-empty stream-specific queue.
-func (q *writeQueue) stream() *stream { return q.s[0].stream }
+// stream returns the stream for stream-specific queue. It can be nil.
+func (q *writeQueue) stream() (*stream, error) {
+	if len(q.s) > 0 {
+		return q.s[0].stream, nil
+	}
+	return nil, errors.New("empty stream write queue in pq")
+}
 
 func (q *writeQueue) empty() bool { return len(q.s) == 0 }
 

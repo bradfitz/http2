@@ -21,9 +21,9 @@ import (
 )
 
 type Item struct {
-	v *writeQueue
+	v  *writeQueue
+	id uint32 // see writeScheduler's take()
 }
-
 type priorityQueue []*Item
 
 func newPriorityQueue() *priorityQueue {
@@ -59,14 +59,16 @@ func (pq *priorityQueue) Pop() interface{} {
 }
 
 func (pq *priorityQueue) push(q *writeQueue) {
-	heap.Push(pq, &Item{v: q})
+	heap.Push(pq, &Item{v: q, id: q.streamID()})
 	q.queued = true
 }
 
-func (pq *priorityQueue) pop() *writeQueue {
-	q := heap.Pop(pq).(*Item).v
+func (pq *priorityQueue) pop() (*writeQueue, uint32) {
+	item := heap.Pop(pq).(*Item)
+	q := item.v
+	id := item.id
 	q.queued = false
-	return q
+	return q, id
 }
 
 func (pq *priorityQueue) len() int {

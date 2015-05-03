@@ -1527,11 +1527,6 @@ func (sc *serverConn) writeHeaders(st *stream, headerData *writeResHeaders, temp
 		errc = tempCh
 	}
 
-	if !sc.clientInitiated(st.id) {
-		// transit state for push promise
-		st.state = stateHalfClosedRemote
-	}
-
 	sc.writeFrameFromHandler(frameWriteMsg{
 		write:  headerData,
 		stream: st,
