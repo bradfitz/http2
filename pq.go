@@ -14,10 +14,12 @@
 // or available via an empty import in the future.
 //
 // See http://http2.github.io/
+
 package http2
 
 import (
 	"container/heap"
+	"fmt"
 )
 
 type Item struct {
@@ -30,6 +32,24 @@ func newPriorityQueue() *priorityQueue {
 	pq := new(priorityQueue)
 	heap.Init(pq)
 	return pq
+}
+
+// for debug: listing all items in pq with details.
+func (pq priorityQueue) String() string {
+	var vf int32
+	var itemID, streamID, parentID uint32
+	ret := "[priorityQueue Items="
+	for i, item := range pq {
+		st := item.v.stream()
+		itemID = item.id
+		if st != nil {
+			streamID = st.id
+			parentID = st.parentID()
+			vf = item.v.vf
+		}
+		ret += fmt.Sprintf("\n\t[Item i=%d, id=%d, stream=%d, parent=%d, vf=%v]", i, itemID, streamID, parentID, vf)
+	}
+	return fmt.Sprintf("%s]", ret)
 }
 
 func (pq priorityQueue) Len() int { return len(pq) }
@@ -66,9 +86,8 @@ func (pq *priorityQueue) push(q *writeQueue) {
 func (pq *priorityQueue) pop() (*writeQueue, uint32) {
 	item := heap.Pop(pq).(*Item)
 	q := item.v
-	id := item.id
 	q.queued = false
-	return q, id
+	return q, item.id
 }
 
 func (pq *priorityQueue) len() int {
