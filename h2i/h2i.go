@@ -11,10 +11,12 @@ The h2i command is an interactive HTTP/2 console.
 Usage:
   $ h2i [flags] <hostname>
 
-Interactive commands in the console:
+Interactive commands in the console: (all parts case-insensitive)
 
   ping [data]
   settings ack
+  settings FOO=n BAR=z
+  headers      (open a new stream by typing HTTP/1.1)
 */
 package main
 
@@ -30,6 +32,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/bradfitz/http2"
@@ -43,13 +47,32 @@ var (
 	flagInsecure  = flag.Bool("insecure", false, "Whether to skip TLS cert validation")
 )
 
-type command func(*h2i, []string) error
+type command struct {
+	run func(*h2i, []string) error // required
+
+	// complete optionally specifies tokens (case-insensitive) which are
+	// valid for this subcommand.
+	complete func() []string
+}
 
 var commands = map[string]command{
-	"ping":     (*h2i).cmdPing,
-	"settings": (*h2i).cmdSettings,
-	"quit":     (*h2i).cmdQuit,
-	"headers":  (*h2i).cmdHeaders,
+	"ping": command{run: (*h2i).cmdPing},
+	"settings": command{
+		run: (*h2i).cmdSettings,
+		complete: func() []string {
+			return []string{
+				"ACK",
+				http2.SettingHeaderTableSize.String(),
+				http2.SettingEnablePush.String(),
+				http2.SettingMaxConcurrentStreams.String(),
+				http2.SettingInitialWindowSize.String(),
+				http2.SettingMaxFrameSize.String(),
+				http2.SettingMaxHeaderListSize.String(),
+			}
+		},
+	},
+	"quit":    command{run: (*h2i).cmdQuit},
+	"headers": command{run: (*h2i).cmdHeaders},
 }
 
 func usage() {
@@ -106,20 +129,21 @@ func main() {
 		}
 		os.Exit(1)
 	}
+	fmt.Fprintf(os.Stdout, "\n")
 }
 
-func (a *h2i) Main() error {
+func (app *h2i) Main() error {
 	cfg := &tls.Config{
-		ServerName:         a.host,
+		ServerName:         app.host,
 		NextProtos:         strings.Split(*flagNextProto, ","),
 		InsecureSkipVerify: *flagInsecure,
 	}
 
-	hostAndPort := withPort(a.host)
+	hostAndPort := withPort(app.host)
 	log.Printf("Connecting to %s ...", hostAndPort)
 	tc, err := tls.Dial("tcp", hostAndPort, cfg)
 	if err != nil {
-		return fmt.Errorf("Error dialing %s: %v", withPort(a.host), err)
+		return fmt.Errorf("Error dialing %s: %v", withPort(app.host), err)
 	}
 	log.Printf("Connected to %v", tc.RemoteAddr())
 	defer tc.Close()
@@ -128,7 +152,7 @@ func (a *h2i) Main() error {
 		return fmt.Errorf("TLS handshake: %v", err)
 	}
 	if !*flagInsecure {
-		if err := tc.VerifyHostname(a.host); err != nil {
+		if err := tc.VerifyHostname(app.host); err != nil {
 			return fmt.Errorf("VerifyHostname: %v", err)
 		}
 	}
@@ -142,7 +166,7 @@ func (a *h2i) Main() error {
 		return err
 	}
 
-	a.framer = http2.NewFramer(tc, tc)
+	app.framer = http2.NewFramer(tc, tc)
 
 	oldState, err := terminal.MakeRaw(0)
 	if err != nil {
@@ -155,31 +179,74 @@ func (a *h2i) Main() error {
 		io.Writer
 	}{os.Stdin, os.Stdout}
 
-	a.term = terminal.NewTerminal(screen, "h2i> ")
-	a.term.AutoCompleteCallback = func(line string, pos int, key rune) (newLine string, newPos int, ok bool) {
+	app.term = terminal.NewTerminal(screen, "h2i> ")
+	lastWord := regexp.MustCompile(`.+\W(\w+)$`)
+	app.term.AutoCompleteCallback = func(line string, pos int, key rune) (newLine string, newPos int, ok bool) {
 		if key != '\t' {
 			return
 		}
-		name, _, ok := lookupCommand(line)
-		if !ok {
+		if pos != len(line) {
+			// TODO: we're being lazy for now, only supporting tab completion at the end.
 			return
 		}
-		return name, len(name), true
+		// Auto-complete for the command itself.
+		if !strings.Contains(line, " ") {
+			var name string
+			name, _, ok = lookupCommand(line)
+			if !ok {
+				return
+			}
+			return name, len(name), true
+		}
+		_, c, ok := lookupCommand(line[:strings.IndexByte(line, ' ')])
+		if !ok || c.complete == nil {
+			return
+		}
+		if strings.HasSuffix(line, " ") {
+			app.logf("%s", strings.Join(c.complete(), " "))
+			return line, pos, true
+		}
+		m := lastWord.FindStringSubmatch(line)
+		if m == nil {
+			return line, len(line), true
+		}
+		soFar := m[1]
+		var match []string
+		for _, cand := range c.complete() {
+			if len(soFar) > len(cand) || !strings.EqualFold(cand[:len(soFar)], soFar) {
+				continue
+			}
+			match = append(match, cand)
+		}
+		if len(match) == 0 {
+			return
+		}
+		if len(match) > 1 {
+			// TODO: auto-complete any common prefix
+			app.logf("%s", strings.Join(match, " "))
+			return line, pos, true
+		}
+		newLine = line[:len(line)-len(soFar)] + match[0]
+		return newLine, len(newLine), true
+
 	}
 
 	errc := make(chan error, 2)
-	go func() { errc <- a.readFrames() }()
-	go func() { errc <- a.readConsole() }()
+	go func() { errc <- app.readFrames() }()
+	go func() { errc <- app.readConsole() }()
 	return <-errc
 }
 
-func (a *h2i) logf(format string, args ...interface{}) {
-	fmt.Fprintf(a.term, format+"\n", args...)
+func (app *h2i) logf(format string, args ...interface{}) {
+	fmt.Fprintf(app.term, format+"\n", args...)
 }
 
-func (a *h2i) readConsole() error {
+func (app *h2i) readConsole() error {
 	for {
-		line, err := a.term.ReadLine()
+		line, err := app.term.ReadLine()
+		if err == io.EOF {
+			return nil
+		}
 		if err != nil {
 			return fmt.Errorf("terminal.ReadLine: %v", err)
 		}
@@ -188,10 +255,10 @@ func (a *h2i) readConsole() error {
 			continue
 		}
 		cmd, args := f[0], f[1:]
-		if _, fn, ok := lookupCommand(cmd); ok {
-			err = fn(a, args)
+		if _, c, ok := lookupCommand(cmd); ok {
+			err = c.run(app, args)
 		} else {
-			a.logf("Unknown command %q", line)
+			app.logf("Unknown command %q", line)
 		}
 		if err == errExitApp {
 			return nil
@@ -210,14 +277,14 @@ func lookupCommand(prefix string) (name string, c command, ok bool) {
 
 	for full, candidate := range commands {
 		if strings.HasPrefix(full, prefix) {
-			if c != nil {
-				return "", nil, false // ambiguous
+			if c.run != nil {
+				return "", command{}, false // ambiguous
 			}
 			c = candidate
 			name = full
 		}
 	}
-	return name, c, c != nil
+	return name, c, c.run != nil
 }
 
 var errExitApp = errors.New("internal sentinel error value to quit the console reading loop")
@@ -231,16 +298,58 @@ func (a *h2i) cmdQuit(args []string) error {
 }
 
 func (a *h2i) cmdSettings(args []string) error {
-	if len(args) == 1 && args[0] == "ack" {
+	if len(args) == 1 && strings.EqualFold(args[0], "ACK") {
 		return a.framer.WriteSettingsAck()
 	}
-	a.logf("TODO: unhandled SETTINGS")
-	return nil
+	var settings []http2.Setting
+	for _, arg := range args {
+		if strings.EqualFold(arg, "ACK") {
+			a.logf("Error: ACK must be only argument with the SETTINGS command")
+			return nil
+		}
+		eq := strings.Index(arg, "=")
+		if eq == -1 {
+			a.logf("Error: invalid argument %q (expected SETTING_NAME=nnnn)", arg)
+			return nil
+		}
+		sid, ok := settingByName(arg[:eq])
+		if !ok {
+			a.logf("Error: unknown setting name %q", arg[:eq])
+			return nil
+		}
+		val, err := strconv.ParseUint(arg[eq+1:], 10, 32)
+		if err != nil {
+			a.logf("Error: invalid argument %q (expected SETTING_NAME=nnnn)", arg)
+			return nil
+		}
+		settings = append(settings, http2.Setting{
+			ID:  sid,
+			Val: uint32(val),
+		})
+	}
+	a.logf("Sending: %v", settings)
+	return a.framer.WriteSettings(settings...)
 }
 
-func (a *h2i) cmdPing(args []string) error {
+func settingByName(name string) (http2.SettingID, bool) {
+	for _, sid := range [...]http2.SettingID{
+		http2.SettingHeaderTableSize,
+		http2.SettingEnablePush,
+		http2.SettingMaxConcurrentStreams,
+		http2.SettingInitialWindowSize,
+		http2.SettingMaxFrameSize,
+		http2.SettingMaxHeaderListSize,
+	} {
+		if strings.EqualFold(sid.String(), name) {
+			return sid, true
+		}
+	}
+	return 0, false
+}
+
+func (app *h2i) cmdPing(args []string) error {
 	if len(args) > 1 {
-		a.logf("invalid PING usage: only accepts 0 or 1 args")
+		app.logf("invalid PING usage: only accepts 0 or 1 args")
 		return nil // nil means don't end the program
 	}
 	var data [8]byte
@@ -249,21 +358,21 @@ func (a *h2i) cmdPing(args []string) error {
 	} else {
 		copy(data[:], "h2i_ping")
 	}
-	return a.framer.WritePing(false, data)
+	return app.framer.WritePing(false, data)
 }
 
-func (a *h2i) cmdHeaders(args []string) error {
+func (app *h2i) cmdHeaders(args []string) error {
 	if len(args) > 0 {
-		a.logf("Error: HEADERS doesn't yet take arguments.")
+		app.logf("Error: HEADERS doesn't yet take arguments.")
 		// TODO: flags for restricting window size, to force CONTINUATION
 		// frames.
 		return nil
 	}
 	var h1req bytes.Buffer
-	a.term.SetPrompt("(as HTTP/1.1)> ")
-	defer a.term.SetPrompt("h2i> ")
+	app.term.SetPrompt("(as HTTP/1.1)> ")
+	defer app.term.SetPrompt("h2i> ")
 	for {
-		line, err := a.term.ReadLine()
+		line, err := app.term.ReadLine()
 		if err != nil {
 			return err
 		}
@@ -275,76 +384,76 @@ func (a *h2i) cmdHeaders(args []string) error {
 	}
 	req, err := http.ReadRequest(bufio.NewReader(&h1req))
 	if err != nil {
-		a.logf("Invalid HTTP/1.1 request: %v", err)
+		app.logf("Invalid HTTP/1.1 request: %v", err)
 		return nil
 	}
-	if a.streamID == 0 {
-		a.streamID = 1
+	if app.streamID == 0 {
+		app.streamID = 1
 	} else {
-		a.streamID += 2
+		app.streamID += 2
 	}
-	a.logf("Opening Stream-ID %d:", a.streamID)
-	hbf := a.encodeHeaders(req)
+	app.logf("Opening Stream-ID %d:", app.streamID)
+	hbf := app.encodeHeaders(req)
 	if len(hbf) > 16<<10 {
-		a.logf("TODO: h2i doesn't yet write CONTINUATION frames. Copy it from transport.go")
+		app.logf("TODO: h2i doesn't yet write CONTINUATION frames. Copy it from transport.go")
 		return nil
 	}
-	return a.framer.WriteHeaders(http2.HeadersFrameParam{
-		StreamID:      a.streamID,
+	return app.framer.WriteHeaders(http2.HeadersFrameParam{
+		StreamID:      app.streamID,
 		BlockFragment: hbf,
 		EndStream:     req.Method == "GET" || req.Method == "HEAD", // good enough for now
 		EndHeaders:    true,                                        // for now
 	})
 }
 
-func (a *h2i) readFrames() error {
+func (app *h2i) readFrames() error {
 	for {
-		f, err := a.framer.ReadFrame()
+		f, err := app.framer.ReadFrame()
 		if err != nil {
 			return fmt.Errorf("ReadFrame: %v", err)
 		}
-		a.logf("%v", f)
+		app.logf("%v", f)
 		switch f := f.(type) {
 		case *http2.PingFrame:
-			a.logf("  Data = %q", f.Data)
+			app.logf("  Data = %q", f.Data)
 		case *http2.SettingsFrame:
 			f.ForeachSetting(func(s http2.Setting) error {
-				a.logf("  %v", s)
-				a.peerSetting[s.ID] = s.Val
+				app.logf("  %v", s)
+				app.peerSetting[s.ID] = s.Val
 				return nil
 			})
 		case *http2.WindowUpdateFrame:
-			a.logf("  Window-Increment = %v\n", f.Increment)
+			app.logf("  Window-Increment = %v\n", f.Increment)
 		case *http2.GoAwayFrame:
-			a.logf("  Last-Stream-ID = %d; Error-Code = %v (%d)\n", f.LastStreamID, f.ErrCode, f.ErrCode)
+			app.logf("  Last-Stream-ID = %d; Error-Code = %v (%d)\n", f.LastStreamID, f.ErrCode, f.ErrCode)
 		case *http2.DataFrame:
-			a.logf("  %q", f.Data())
+			app.logf("  %q", f.Data())
 		case *http2.HeadersFrame:
 			if f.HasPriority() {
-				a.logf("  PRIORITY = %v", f.Priority)
+				app.logf("  PRIORITY = %v", f.Priority)
 			}
-			if a.hdec == nil {
+			if app.hdec == nil {
 				// TODO: if the user uses h2i to send a SETTINGS frame advertising
 				// something larger, we'll need to respect SETTINGS_HEADER_TABLE_SIZE
 				// and stuff here instead of using the 4k default. But for now:
 				tableSize := uint32(4 << 10)
-				a.hdec = hpack.NewDecoder(tableSize, a.onNewHeaderField)
+				app.hdec = hpack.NewDecoder(tableSize, app.onNewHeaderField)
 			}
-			a.hdec.Write(f.HeaderBlockFragment())
+			app.hdec.Write(f.HeaderBlockFragment())
 		}
 	}
 }
 
 // called from readLoop
-func (a *h2i) onNewHeaderField(f hpack.HeaderField) {
+func (app *h2i) onNewHeaderField(f hpack.HeaderField) {
 	if f.Sensitive {
-		a.logf("  %s = %q (SENSITIVE)", f.Name, f.Value)
+		app.logf("  %s = %q (SENSITIVE)", f.Name, f.Value)
 	}
-	a.logf("  %s = %q", f.Name, f.Value)
+	app.logf("  %s = %q", f.Name, f.Value)
 }
 
-func (a *h2i) encodeHeaders(req *http.Request) []byte {
-	a.hbuf.Reset()
+func (app *h2i) encodeHeaders(req *http.Request) []byte {
+	app.hbuf.Reset()
 
 	// TODO(bradfitz): figure out :authority-vs-Host stuff between http2 and Go
 	host := req.Host
@@ -357,10 +466,10 @@ func (a *h2i) encodeHeaders(req *http.Request) []byte {
 		path = "/"
 	}
 
-	a.writeHeader(":authority", host) // probably not right for all sites
-	a.writeHeader(":method", req.Method)
-	a.writeHeader(":path", path)
-	a.writeHeader(":scheme", "https")
+	app.writeHeader(":authority", host) // probably not right for all sites
+	app.writeHeader(":method", req.Method)
+	app.writeHeader(":path", path)
+	app.writeHeader(":scheme", "https")
 
 	for k, vv := range req.Header {
 		lowKey := strings.ToLower(k)
@@ -368,13 +477,13 @@ func (a *h2i) encodeHeaders(req *http.Request) []byte {
 			continue
 		}
 		for _, v := range vv {
-			a.writeHeader(lowKey, v)
+			app.writeHeader(lowKey, v)
 		}
 	}
-	return a.hbuf.Bytes()
+	return app.hbuf.Bytes()
 }
 
-func (a *h2i) writeHeader(name, value string) {
-	a.henc.WriteField(hpack.HeaderField{Name: name, Value: value})
-	a.logf(" %s = %s", name, value)
+func (app *h2i) writeHeader(name, value string) {
+	app.henc.WriteField(hpack.HeaderField{Name: name, Value: value})
+	app.logf(" %s = %s", name, value)
 }
