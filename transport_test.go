@@ -166,3 +166,35 @@ func TestTransportAbortClosesPipes(t *testing.T) {
 		t.Fatal("timeout")
 	}
 }
+
+func TestTransportAbortDuringResponseHeaders(t *testing.T) {
+	var st *serverTester
+	st = newServerTester(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			// close conn before response starts
+			st.closeConn()
+		},
+		optOnlyServer,
+	)
+	defer st.Close()
+
+	tr := &Transport{
+		InsecureTLSDial: true,
+	}
+
+	done := make(chan bool)
+	go func() {
+		req, _ := http.NewRequest("GET", st.ts.URL, nil)
+		_, err := tr.RoundTrip(req)
+		if err == nil {
+			t.Error("expected error from RoundTrip")
+		}
+		done <- true
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Error("timeout")
+	}
+}
