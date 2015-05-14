@@ -304,7 +304,7 @@ func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	cs := cc.newStream()
-	hasBody := false // TODO
+	hasBody := req.Body != nil
 
 	// we send: HEADERS[+CONTINUATION] + (DATA?)
 	hdrs := cc.encodeHeaders(req)
@@ -328,19 +328,42 @@ func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
 			cc.fr.WriteContinuation(cs.ID, endHeaders, chunk)
 		}
 	}
-	cc.bw.Flush()
 	werr := cc.werr
-	cc.mu.Unlock()
-
-	if hasBody {
-		// TODO: write data. and it should probably be interleaved:
-		//   go ... io.Copy(dataFrameWriter{cc, cs, ...}, req.Body) ... etc
+	if !hasBody {
+		cc.bw.Flush()
+	} else {
+		// flush is done below after writing body
 	}
+	cc.mu.Unlock()
 
 	if werr != nil {
 		return nil, werr
 	}
 
+	var copyerr error
+	if hasBody {
+		w := dataFrameWriter{cc, cs}
+		_, copyerr = io.Copy(w, req.Body)
+
+		cc.mu.Lock()
+		if copyerr != nil {
+			// We had a read error first and need to notify the
+			// downstream server.
+			w.cc.fr.WriteRSTStream(w.cs.ID, ErrCodeConnect) // Is this the right error code?
+		} else {
+			w.cc.fr.WriteData(w.cs.ID, true, nil)
+		}
+		cc.bw.Flush()
+		werr = cc.werr
+		cc.mu.Unlock()
+	}
+
+	if werr != nil {
+		return nil, werr
+	}
+	if copyerr != nil {
+		return nil, copyerr
+	}
 	re := <-cs.resc
 	if re.err != nil {
 		return nil, re.err
@@ -550,4 +573,23 @@ func (cc *clientConn) onNewHeaderField(f hpack.HeaderField) {
 		return
 	}
 	cc.nextRes.Header.Add(http.CanonicalHeaderKey(f.Name), f.Value)
+}
+
+// dataFrameWriter writes data frames to its clientConn for its clientStream.
+// Data frames are interleaved with other streams.
+//
+// TODO: dataFrameWriter needs to respect flow control.
+type dataFrameWriter struct {
+	cc *clientConn
+	cs *clientStream
+}
+
+// Write writes a data frame with payload b.
+func (w dataFrameWriter) Write(b []byte) (int, error) {
+	w.cc.mu.Lock()
+	defer w.cc.mu.Unlock()
+	if len(b) > int(w.cc.maxFrameSize) {
+		b = b[:w.cc.maxFrameSize]
+	}
+	return len(b), w.cc.fr.WriteData(w.cs.ID, false, b)
 }

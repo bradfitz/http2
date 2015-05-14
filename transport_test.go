@@ -6,12 +6,14 @@
 package http2
 
 import (
+	"errors"
 	"flag"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -38,53 +40,93 @@ func TestTransportExternal(t *testing.T) {
 	res.Write(os.Stdout)
 }
 
+type errReader struct{}
+
+func (r errReader) Read(_ []byte) (int, error) { return 0, errors.New("errReader: error") }
+
 func TestTransport(t *testing.T) {
-	const body = "sup"
+	tests := []struct {
+		method  string
+		body    io.Reader
+		wantErr bool
+	}{
+		{"GET", nil, false},
+		{"POST", strings.NewReader("the body"), false},
+		{"POST", errReader{}, true},
+	}
+
 	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, body)
+		body, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal("ReadAll:", err)
+		}
+		w.Write(body)
 	})
 	defer st.Close()
 
 	tr := &Transport{InsecureTLSDial: true}
 	defer tr.CloseIdleConnections()
 
-	req, err := http.NewRequest("GET", st.ts.URL, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err := tr.RoundTrip(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer res.Body.Close()
+	for i, tt := range tests {
+		t.Log("i:", i)
+		req, err := http.NewRequest("GET", st.ts.URL, tt.body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := tr.RoundTrip(req)
+		if err != nil {
+			if !tt.wantErr {
+				t.Error("Unexpected RoundTrip error:", err)
+			}
+			continue
+		}
+		defer res.Body.Close()
 
-	t.Logf("Got res: %+v", res)
-	if g, w := res.StatusCode, 200; g != w {
-		t.Errorf("StatusCode = %v; want %v", g, w)
-	}
-	if g, w := res.Status, "200 OK"; g != w {
-		t.Errorf("Status = %q; want %q", g, w)
-	}
-	wantHeader := http.Header{
-		"Content-Length": []string{"3"},
-		"Content-Type":   []string{"text/plain; charset=utf-8"},
-	}
-	if !reflect.DeepEqual(res.Header, wantHeader) {
-		t.Errorf("res Header = %v; want %v", res.Header, wantHeader)
-	}
-	if res.Request != req {
-		t.Errorf("Response.Request = %p; want %p", res.Request, req)
-	}
-	if res.TLS == nil {
-		t.Error("Response.TLS = nil; want non-nil")
-	}
-	slurp, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		t.Errorf("Body read: %v", err)
-	} else if string(slurp) != body {
-		t.Errorf("Body = %q; want %q", slurp, body)
-	}
+		t.Logf("Got res: %+v", res)
+		if g, w := res.StatusCode, 200; g != w {
+			t.Errorf("StatusCode = %v; want %v", g, w)
+		}
+		if g, w := res.Status, "200 OK"; g != w {
+			t.Errorf("Status = %q; want %q", g, w)
+		}
 
+		sr, _ := tt.body.(*strings.Reader)
+		if i == 1 && sr == nil {
+			panic("not a strings reader")
+		}
+
+		var (
+			wantContentLength int
+			wantBody          string
+		)
+		if sr != nil {
+			sr.Seek(0, 0)
+			wantContentLength = sr.Len()
+			slurp, _ := ioutil.ReadAll(tt.body)
+			wantBody = string(slurp)
+		}
+
+		wantHeader := http.Header{
+			"Content-Length": []string{strconv.Itoa(wantContentLength)},
+			"Content-Type":   []string{"text/plain; charset=utf-8"},
+		}
+		if !reflect.DeepEqual(res.Header, wantHeader) {
+			t.Errorf("res Header = %v; want %v", res.Header, wantHeader)
+		}
+		if res.Request != req {
+			t.Errorf("Response.Request = %p; want %p", res.Request, req)
+		}
+		if res.TLS == nil {
+			t.Error("Response.TLS = nil; want non-nil")
+		}
+
+		slurp, err := ioutil.ReadAll(res.Body)
+		if err != nil {
+			t.Errorf("Unexpected Body ReadAll error: %v", err)
+		} else if string(slurp) != wantBody {
+			t.Errorf("Body = %q; want %q", slurp, wantBody)
+		}
+	}
 }
 
 func TestTransportReusesConns(t *testing.T) {
