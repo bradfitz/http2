@@ -533,15 +533,22 @@ func (sc *serverConn) canonicalHeader(v string) string {
 // readFrames is the loop that reads incoming frames.
 // It's run on its own goroutine.
 func (sc *serverConn) readFrames() {
+	defer close(sc.readFrameCh)
+
 	g := make(gate, 1)
 	for {
 		f, err := sc.framer.ReadFrame()
 		if err != nil {
 			sc.readFrameErrCh <- err
-			close(sc.readFrameCh)
 			return
 		}
-		sc.readFrameCh <- frameAndGate{f, g}
+		select {
+		case sc.readFrameCh <- frameAndGate{f, g}:
+		case <-sc.doneServing:
+			// serve loop ended due to invalid hpack encoding,
+			// settings timeout, goaway timeout, etc.
+			return
+		}
 		// We can't read another frame until this one is
 		// processed, as the ReadFrame interface doesn't copy
 		// memory.  The Frame accessor methods access the last
