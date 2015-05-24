@@ -216,6 +216,12 @@ func (st *serverTester) writeHeaders(p HeadersFrameParam) {
 	}
 }
 
+func (st *serverTester) writeContinuation(id uint32, end bool, frag []byte) {
+	if err := st.fr.WriteContinuation(id, end, frag); err != nil {
+		st.t.Fatalf("Error writing CONTINUATION: %v", err)
+	}
+}
+
 func (st *serverTester) encodeHeaderField(k, v string) {
 	err := st.hpackEnc.WriteField(hpack.HeaderField{Name: k, Value: v})
 	if err != nil {
@@ -758,10 +764,7 @@ func TestServer_Request_WithContinuation(t *testing.T) {
 					EndHeaders:    false, // we'll have continuation frames
 				})
 			} else {
-				err := st.fr.WriteContinuation(1, len(remain) == 0, chunk)
-				if err != nil {
-					t.Fatal(err)
-				}
+				st.writeContinuation(1, len(remain) == 0, chunk)
 			}
 			chunks++
 		}
@@ -1171,9 +1174,7 @@ func TestServer_Rejects_HeadersEnd_Then_Continuation(t *testing.T) {
 			EndHeaders:    true,
 		})
 		st.wantHeaders()
-		if err := st.fr.WriteContinuation(1, true, encodeHeaderNoImplicit(t, "foo", "bar")); err != nil {
-			t.Fatal(err)
-		}
+		st.writeContinuation(1, true, encodeHeaderNoImplicit(t, "foo", "bar"))
 	})
 }
 
@@ -1186,9 +1187,7 @@ func TestServer_Rejects_HeadersNoEnd_Then_ContinuationWrongStream(t *testing.T) 
 			EndStream:     true,
 			EndHeaders:    false,
 		})
-		if err := st.fr.WriteContinuation(3, true, encodeHeaderNoImplicit(t, "foo", "bar")); err != nil {
-			t.Fatal(err)
-		}
+		st.writeContinuation(3, true, encodeHeaderNoImplicit(t, "foo", "bar"))
 	})
 }
 
@@ -1209,9 +1208,7 @@ func TestServer_Rejects_Headers0(t *testing.T) {
 func TestServer_Rejects_Continuation0(t *testing.T) {
 	testServerRejects(t, func(st *serverTester) {
 		st.fr.AllowIllegalWrites = true
-		if err := st.fr.WriteContinuation(0, true, st.encodeHeader()); err != nil {
-			t.Fatal(err)
-		}
+		st.writeContinuation(0, true, st.encodeHeader())
 	})
 }
 
@@ -1877,9 +1874,7 @@ func TestServer_Rejects_Too_Many_Streams(t *testing.T) {
 		EndStream:     true,
 		EndHeaders:    false, // CONTINUATION coming
 	})
-	if err := st.fr.WriteContinuation(rejectID, true, frag2); err != nil {
-		t.Fatal(err)
-	}
+	st.writeContinuation(rejectID, true, frag2)
 	st.wantRSTStream(rejectID, ErrCodeProtocol)
 
 	// But let a handler finish:
@@ -2070,7 +2065,7 @@ func TestServer_ReadFrames_Exits(t *testing.T) {
 	st.greet()
 
 	// Cause a ConnectionError and the death of the serve loop.
-	st.fr.WriteContinuation(99, true, nil)
+	st.writeContinuation(99, true, nil)
 	select {
 	case <-st.sc.doneServing:
 	case <-time.After(5 * time.Second):
