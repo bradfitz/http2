@@ -302,7 +302,7 @@ func isBadCipher(cipher uint16) bool {
 }
 
 func (sc *serverConn) rejectConn(err ErrCode, debug string) {
-	log.Printf("REJECTING conn: %v, %s", err, debug)
+	sc.logf("REJECTING conn: %v, %s", err, debug)
 	// ignoring errors. hanging up anyway.
 	sc.framer.WriteGoAway(0, err, []byte(debug))
 	sc.bw.Flush()
@@ -985,7 +985,7 @@ func (sc *serverConn) processFrame(f Frame) error {
 		// frame as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.
 		return ConnectionError(ErrCodeProtocol)
 	default:
-		log.Printf("Ignoring frame: %v", f.Header())
+		sc.logf("Ignoring frame: %v", f.Header())
 		return nil
 	}
 }
