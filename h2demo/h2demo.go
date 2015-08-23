@@ -35,10 +35,12 @@ import (
 )
 
 var (
-	openFirefox = flag.Bool("openff", false, "Open Firefox")
-	addr        = flag.String("addr", "localhost:4430", "TLS address to listen on")
-	httpAddr    = flag.String("httpaddr", "", "If non-empty, address to listen for regular HTTP on")
-	prod        = flag.Bool("prod", false, "Whether to configure itself to be the production http2.golang.org server.")
+	openFirefox  = flag.Bool("openff", false, "Open Firefox")
+	addr         = flag.String("addr", "localhost:4430", "TLS address to listen on")
+	bindAddr     = flag.String("bindaddr", "0.0.0.0:4430", "TLS address to bind on")
+	httpAddr     = flag.String("httpaddr", "", "If non-empty, address to listen for regular HTTP on")
+	httpBindAddr = flag.String("httpbindaddr", *httpAddr, "If non-empty, address to bind on for regular HTTP")
+	prod         = flag.Bool("prod", false, "Whether to configure itself to be the production http2.golang.org server.")
 )
 
 func homeOldHTTP(w http.ResponseWriter, r *http.Request) {
@@ -398,7 +400,7 @@ func main() {
 	var srv http.Server
 	flag.BoolVar(&http2.VerboseLogs, "verbose", false, "Verbose HTTP/2 debugging.")
 	flag.Parse()
-	srv.Addr = *addr
+	srv.Addr = *bindAddr
 
 	registerHandlers()
 
@@ -407,12 +409,12 @@ func main() {
 		log.Fatal(serveProd())
 	}
 
-	url := "https://" + *addr + "/"
+	url := "https://" + *bindAddr + "/"
 	log.Printf("Listening on " + url)
 	http2.ConfigureServer(&srv, &http2.Server{})
 
-	if *httpAddr != "" {
-		go func() { log.Fatal(http.ListenAndServe(*httpAddr, nil)) }()
+	if *httpBindAddr != "" {
+		go func() { log.Fatal(http.ListenAndServe(*httpBindAddr, nil)) }()
 	}
 
 	go func() {
