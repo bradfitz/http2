@@ -1,17 +1,25 @@
-This is a work-in-progress HTTP/2 implementation for Go.
+This was the old home of Go's HTTP/2 implementation.
 
-It will eventually live in the Go standard library and won't require
-any changes to your code to use.  It will just be automatic.
+It now lives in the Go repo.
 
-Status:
+I'm keeping this tree working for now, but please update your imports
+to:
 
-* The server support is pretty good. A few things are missing
-  but are being worked on.
-* The client work has just started but shares a lot of code
-  is coming along much quicker.
+    import "golang.org/x/net/http2"
 
-Docs are at https://godoc.org/github.com/bradfitz/http2
+The plan is still to have this transparently enabled by default in Go 1.6+.
 
-Demo test server at https://http2.golang.org/
+The code is now at:
 
-Help & bug reports welcome.
+    https://go.googlesource.com/net/ (main repo)
+    ... in directory https://go.googlesource.com/net/+/master/http2/
+
+Github mirror:
+    https://github.com/golang/net/tree/master/http2 (mirror)
+
+Now that it's on Gerrit, we no longer take Github pull requests.
+
+Contribution instructions:
+   https://golang.org/doc/contribute.html
+
+
