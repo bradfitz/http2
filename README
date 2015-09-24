@@ -17,9 +17,13 @@ The code is now at:
 Github mirror:
     https://github.com/golang/net/tree/master/http2 (mirror)
 
-Now that it's on Gerrit, we no longer take Github pull requests.
+Bugs should be filed in Go's main bug tracker:
 
-Contribution instructions:
+    https://github.com/golang/go/issues/new?title=x/net/http2:+
+
+Now that it's on Gerrit, we no longer use Github's pull requests and
+are using Gerrit instead for code review. Contribution instructions:
+
    https://golang.org/doc/contribute.html
 
 
