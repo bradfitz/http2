@@ -7,7 +7,13 @@ to:
 
     import "golang.org/x/net/http2"
 
-The plan is still to have this transparently enabled by default in Go 1.6+.
+Godoc is:
+
+    https://godoc.org/golang.org/x/net/http2
+
+http2 is enabled by default in Go 1.6+ with no changes to your
+code. Unless you're doing something weird, you should not need to
+import golang.org/x/net/http2.
 
 The code is now at:
 
@@ -19,11 +25,9 @@ Github mirror:
 
 Bugs should be filed in Go's main bug tracker:
 
-    https://github.com/golang/go/issues/new?title=x/net/http2:+
+    https://golang.org/s/http2bug
 
 Now that it's on Gerrit, we no longer use Github's pull requests and
 are using Gerrit instead for code review. Contribution instructions:
 
    https://golang.org/doc/contribute.html
-
-
