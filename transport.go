@@ -15,6 +15,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +28,12 @@ type Transport struct {
 
 	// TODO: remove this and make more general with a TLS dial hook, like http
 	InsecureTLSDial bool
+
+	// Proxy specifies a function to return a proxy for a given
+	// Request. If the function returns a non-nil error, the
+	// request is aborted with the provided error.
+	// If Proxy is nil or returns a nil *URL, no proxy is used.
+	Proxy func(*http.Request) (*url.URL, error)
 
 	connMu sync.Mutex
 	conns  map[string][]*clientConn // key is host:port
@@ -81,18 +88,31 @@ func (sew stickyErrWriter) Write(p []byte) (n int, err error) {
 	return
 }
 
-func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Scheme != "https" {
+func (t *Transport) RoundTrip(req *http.Request) (res *http.Response, err error) {
+	if req.URL.Scheme != "https" && t.Proxy == nil {
 		if t.Fallback == nil {
 			return nil, errors.New("http2: unsupported scheme and no Fallback")
 		}
 		return t.Fallback.RoundTrip(req)
 	}
 
-	host, port, err := net.SplitHostPort(req.URL.Host)
-	if err != nil {
-		host = req.URL.Host
-		port = "443"
+	var host, port string
+	if t.Proxy == nil {
+		host, port, err = net.SplitHostPort(req.URL.Host)
+		if err != nil {
+			host = req.URL.Host
+			port = "443"
+		}
+	} else {
+		u, err := t.Proxy(req)
+		if err != nil {
+			return nil, err
+		}
+		host, port, err = net.SplitHostPort(u.Host)
+		if err != nil {
+			host = u.Host
+			port = "443"
+		}
 	}
 
 	for {
@@ -100,7 +120,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if err != nil {
 			return nil, err
 		}
-		res, err := cc.roundTrip(req)
+		res, err = cc.roundTrip(req)
 		if shouldRetryRequest(err) { // TODO: or clientconn is overloaded (too many outstanding requests)?
 			continue
 		}
@@ -361,7 +381,7 @@ func (cc *clientConn) encodeHeaders(req *http.Request) []byte {
 		host = req.URL.Host
 	}
 
-	path := req.URL.Path
+	path := req.RequestURI
 	if path == "" {
 		path = "/"
 	}
@@ -369,7 +389,7 @@ func (cc *clientConn) encodeHeaders(req *http.Request) []byte {
 	cc.writeHeader(":authority", host) // probably not right for all sites
 	cc.writeHeader(":method", req.Method)
 	cc.writeHeader(":path", path)
-	cc.writeHeader(":scheme", "https")
+	cc.writeHeader(":scheme", req.URL.Scheme)
 
 	for k, vv := range req.Header {
 		lowKey := strings.ToLower(k)
