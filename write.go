@@ -142,7 +142,37 @@ func (w *writeResHeaders) writeFrame(ctx writeContext) error {
 	if len(headerBlock) == 0 {
 		panic("unexpected empty hpack")
 	}
+	return writeHeaders(ctx, w.streamID, 0, w.endStream, headerBlock)
+}
 
+// writePPHeaders is a request to write a Push Promise and 0+ CONTINUATION frames
+// TODO(dmorsing): when we have a client, reuse this to code to write requests
+type writePPHeaders struct {
+	streamID uint32
+	reqpm    *requestParam
+}
+
+func (w *writePPHeaders) writeFrame(ctx writeContext) error {
+	enc, buf := ctx.HeaderEncoder()
+	buf.Reset()
+	enc.WriteField(hpack.HeaderField{Name: ":method", Value: w.reqpm.method})
+	enc.WriteField(hpack.HeaderField{Name: ":path", Value: w.reqpm.path})
+	enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: w.reqpm.scheme})
+	enc.WriteField(hpack.HeaderField{Name: ":authority", Value: w.reqpm.authority})
+	for k, vv := range w.reqpm.header {
+		k = lowerHeader(k)
+		for _, v := range vv {
+			enc.WriteField(hpack.HeaderField{Name: k, Value: v})
+		}
+	}
+	headerBlock := buf.Bytes()
+	if len(headerBlock) == 0 {
+		panic("unexpected empty hpack")
+	}
+	return writeHeaders(ctx, w.streamID, w.reqpm.stream.id, true, headerBlock)
+}
+
+func writeHeaders(ctx writeContext, streamid uint32, promiseid uint32, endStream bool, headerBlock []byte) error {
 	// For now we're lazy and just pick the minimum MAX_FRAME_SIZE
 	// that all peers must support (16KB). Later we could care
 	// more and send larger frames if the peer advertised it, but
@@ -162,14 +192,19 @@ func (w *writeResHeaders) writeFrame(ctx writeContext) error {
 		var err error
 		if first {
 			first = false
-			err = ctx.Framer().WriteHeaders(HeadersFrameParam{
-				StreamID:      w.streamID,
+			hfp := HeadersFrameParam{
+				StreamID:      streamid,
 				BlockFragment: frag,
-				EndStream:     w.endStream,
+				EndStream:     endStream,
 				EndHeaders:    endHeaders,
-			})
+			}
+			if promiseid != 0 {
+				hfp.PushPromise = true
+				hfp.PromiseID = promiseid
+			}
+			err = ctx.Framer().WriteHeaders(hfp)
 		} else {
-			err = ctx.Framer().WriteContinuation(w.streamID, endHeaders, frag)
+			err = ctx.Framer().WriteContinuation(streamid, endHeaders, frag)
 		}
 		if err != nil {
 			return err

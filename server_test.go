@@ -442,6 +442,18 @@ func (st *serverTester) wantSettingsAck() {
 
 }
 
+func (st *serverTester) wantPushPromise() *PushPromiseFrame {
+	f, err := st.readFrame()
+	if err != nil {
+		st.t.Fatal(err)
+	}
+	ppf, ok := f.(*PushPromiseFrame)
+	if !ok {
+		st.t.Fatalf("Wanted PushPromise, received %T", ppf)
+	}
+	return ppf
+}
+
 func TestServer(t *testing.T) {
 	gotReq := make(chan bool, 1)
 	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1211,11 +1223,12 @@ func TestServer_Rejects_Continuation0(t *testing.T) {
 
 func TestServer_Rejects_PushPromise(t *testing.T) {
 	testServerRejects(t, func(st *serverTester) {
-		pp := PushPromiseParam{
-			StreamID:  1,
-			PromiseID: 3,
+		pp := HeadersFrameParam{
+			PushPromise: true,
+			StreamID:    1,
+			PromiseID:   3,
 		}
-		if err := st.fr.WritePushPromise(pp); err != nil {
+		if err := st.fr.WriteHeaders(pp); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -1784,6 +1797,31 @@ func TestServer_Response_Automatic100Continue(t *testing.T) {
 			t.Errorf("expect data stream end")
 		}
 	})
+}
+
+func TestServer_Response_PushPromise(t *testing.T) {
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		if r.URL.Path == "/" {
+			p := w.(Pusher)
+			p.Push("GET", "/push", nil)
+		}
+	})
+	st.greet()
+	getSlash(st)
+	ppf := st.wantPushPromise()
+	if !ppf.HeadersEnded() {
+		t.Fatal("want END_HEADERS flag")
+	}
+	for i := 0; i < 2; i++ {
+		hf := st.wantHeaders()
+		if !hf.HeadersEnded() {
+			t.Fatal("want END_HEADERS flag")
+		}
+		if !hf.StreamEnded() {
+			t.Fatal("want END_STREAM flag")
+		}
+	}
 }
 
 func TestServer_HandlerWriteErrorOnDisconnect(t *testing.T) {
