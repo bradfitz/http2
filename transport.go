@@ -37,6 +37,8 @@ type clientConn struct {
 	tconn    *tls.Conn
 	tlsState *tls.ConnectionState
 	connKey  []string // key(s) this connection is cached in, in t.conns
+	flow     flow     // conn-wide (not stream-specific) outbound flow control
+	inflow   flow     // conn-wide inbound flow control
 
 	readerDone chan struct{} // closed on error
 	readerErr  error         // set before readerDone is closed
@@ -55,16 +57,19 @@ type clientConn struct {
 	// Settings from peer:
 	maxFrameSize         uint32
 	maxConcurrentStreams uint32
-	initialWindowSize    uint32
+	initialWindowSize    uint32       // TODO(bgentry): why is this int32 on serverConn?
 	hbuf                 bytes.Buffer // HPACK encoder writes into this
 	henc                 *hpack.Encoder
 }
 
 type clientStream struct {
-	ID   uint32
-	resc chan resAndError
-	pw   *io.PipeWriter
-	pr   *io.PipeReader
+	ID        uint32
+	resc      chan resAndError
+	pw        *io.PipeWriter
+	pr        *io.PipeReader
+	flow      flow // what the client is allowed to POST/etc to server
+	inflow    flow // limits writing from server to client
+	sentReset bool // only true once detached from streams map
 }
 
 type stickyErrWriter struct {
@@ -217,19 +222,22 @@ func (t *Transport) newClientConn(host, port, key string) (*clientConn, error) {
 		tlsState:             &state,
 		readerDone:           make(chan struct{}),
 		nextStreamID:         1,
-		maxFrameSize:         16 << 10, // spec default
-		initialWindowSize:    65535,    // spec default
-		maxConcurrentStreams: 1000,     // "infinite", per spec. 1000 seems good enough.
+		maxFrameSize:         16 << 10,          // spec default
+		initialWindowSize:    initialWindowSize, // spec default
+		maxConcurrentStreams: 1000,              // "infinite", per spec. 1000 seems good enough.
 		streams:              make(map[uint32]*clientStream),
 	}
 	cc.bw = bufio.NewWriter(stickyErrWriter{tconn, &cc.werr})
 	cc.br = bufio.NewReader(tconn)
 	cc.fr = NewFramer(cc.bw, cc.br)
 	cc.henc = hpack.NewEncoder(&cc.hbuf)
+	cc.flow.add(initialWindowSize)
+	cc.inflow.add(initialWindowSize)
 
 	cc.fr.WriteSettings()
 	// TODO: re-send more conn-level flow control tokens when server uses all these.
 	cc.fr.WriteWindowUpdate(0, 1<<30) // um, 0x7fffffff doesn't work to Google? it hangs?
+	cc.inflow.add(1 << 30)
 	cc.bw.Flush()
 	if cc.werr != nil {
 		return nil, cc.werr
@@ -295,6 +303,20 @@ func (cc *clientConn) closeIfIdle() {
 	cc.tconn.Close()
 }
 
+func (cc *clientConn) resetStream(se StreamError) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	if cs, ok := cc.streams[se.StreamID]; ok {
+		delete(cc.streams, se.StreamID)
+		cs.pw.CloseWithError(se)
+		if err := cc.fr.WriteRSTStream(se.StreamID, ErrCodeFlowControl); err != nil {
+			// TODO(bgentry): do something proper with this error
+			panic(err)
+		}
+		cs.sentReset = true
+	}
+}
+
 func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	cc.mu.Lock()
 
@@ -304,37 +326,20 @@ func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	cs := cc.newStream()
-	hasBody := false // TODO
+	hasBody := req.Body != nil
 
 	// we send: HEADERS[+CONTINUATION] + (DATA?)
-	hdrs := cc.encodeHeaders(req)
-	first := true
-	for len(hdrs) > 0 {
-		chunk := hdrs
-		if len(chunk) > int(cc.maxFrameSize) {
-			chunk = chunk[:cc.maxFrameSize]
-		}
-		hdrs = hdrs[len(chunk):]
-		endHeaders := len(hdrs) == 0
-		if first {
-			cc.fr.WriteHeaders(HeadersFrameParam{
-				StreamID:      cs.ID,
-				BlockFragment: chunk,
-				EndStream:     !hasBody,
-				EndHeaders:    endHeaders,
-			})
-			first = false
-		} else {
-			cc.fr.WriteContinuation(cs.ID, endHeaders, chunk)
-		}
-	}
+	cc.writeHeaders(cs.ID, req)
 	cc.bw.Flush()
 	werr := cc.werr
 	cc.mu.Unlock()
 
 	if hasBody {
-		// TODO: write data. and it should probably be interleaved:
-		//   go ... io.Copy(dataFrameWriter{cc, cs, ...}, req.Body) ... etc
+		go func(dst io.WriteCloser) {
+			defer dst.Close()
+			io.Copy(dst, req.Body)
+		}(dataFrameWriter{cc, cs, req.Trailer})
+		// TODO(bgentry): trailers? can't close stream yet if there are trailers.
 	}
 
 	if werr != nil {
@@ -371,7 +376,12 @@ func (cc *clientConn) encodeHeaders(req *http.Request) []byte {
 	cc.writeHeader(":path", path)
 	cc.writeHeader(":scheme", "https")
 
-	for k, vv := range req.Header {
+	cc.encodeHeader(req.Header)
+	return cc.hbuf.Bytes()
+}
+
+func (cc *clientConn) encodeHeader(h http.Header) {
+	for k, vv := range h {
 		lowKey := strings.ToLower(k)
 		if lowKey == "host" {
 			continue
@@ -380,12 +390,51 @@ func (cc *clientConn) encodeHeaders(req *http.Request) []byte {
 			cc.writeHeader(lowKey, v)
 		}
 	}
+}
+
+// requires cc.mu be held.
+func (cc *clientConn) encodeTrailers(trailer http.Header) []byte {
+	cc.hbuf.Reset()
+	cc.encodeHeader(trailer)
 	return cc.hbuf.Bytes()
 }
 
 func (cc *clientConn) writeHeader(name, value string) {
 	log.Printf("sending %q = %q", name, value)
 	cc.henc.WriteField(hpack.HeaderField{Name: name, Value: value})
+}
+
+// requires cc.mu be held.
+func (cc *clientConn) writeHeaders(streamID uint32, req *http.Request) {
+	cc.splitAndWriteHeaders(streamID, cc.encodeHeaders(req), req.Body == nil)
+}
+
+// requires cc.mu be held.
+func (cc *clientConn) writeTrailers(streamID uint32, trailer http.Header) {
+	cc.splitAndWriteHeaders(streamID, cc.encodeTrailers(trailer), true)
+}
+
+func (cc *clientConn) splitAndWriteHeaders(streamID uint32, hdrs []byte, endStream bool) {
+	first := true
+	for len(hdrs) > 0 {
+		chunk := hdrs
+		if len(chunk) > int(cc.maxFrameSize) {
+			chunk = chunk[:cc.maxFrameSize]
+		}
+		hdrs = hdrs[len(chunk):]
+		endHeaders := len(hdrs) == 0
+		if first {
+			cc.fr.WriteHeaders(HeadersFrameParam{
+				StreamID:      streamID,
+				BlockFragment: chunk,
+				EndStream:     endStream,
+				EndHeaders:    endHeaders,
+			})
+			first = false
+		} else {
+			cc.fr.WriteContinuation(streamID, endHeaders, chunk)
+		}
+	}
 }
 
 type resAndError struct {
@@ -399,6 +448,11 @@ func (cc *clientConn) newStream() *clientStream {
 		ID:   cc.nextStreamID,
 		resc: make(chan resAndError, 1),
 	}
+	cs.flow.conn = &cc.flow // link to conn-level counter
+	cs.flow.add(int32(cc.initialWindowSize))
+	cs.inflow.conn = &cc.inflow      // link to conn-level counter
+	cs.inflow.add(initialWindowSize) // TODO: update this when we send a higher initial window size in the initial settings
+
 	cc.nextStreamID += 2
 	cc.streams[cs.ID] = cs
 	return cs
@@ -491,7 +545,13 @@ func (cc *clientConn) readLoop() {
 			cc.hdec.Write(f.HeaderBlockFragment())
 		case *DataFrame:
 			log.Printf("DATA: %q", f.Data())
-			cs.pw.Write(f.Data())
+			if int(cs.inflow.available()) < len(f.Data()) {
+				cc.resetStream(StreamError{cs.ID, ErrCodeFlowControl})
+				continue
+			}
+			cs.inflow.take(int32(len(f.Data())))
+			n, _ := cs.pw.Write(f.Data())
+			cc.noteBodyRead(cs, n)
 		case *GoAwayFrame:
 			cc.t.removeClientConn(cc)
 			if f.ErrCode != 0 {
@@ -550,4 +610,87 @@ func (cc *clientConn) onNewHeaderField(f hpack.HeaderField) {
 		return
 	}
 	cc.nextRes.Header.Add(http.CanonicalHeaderKey(f.Name), f.Value)
+}
+
+func (cc *clientConn) noteBodyRead(cs *clientStream, n int) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	cc.sendWindowUpdate(nil, n) // conn-level
+	// TODO(bgentry): Don't send this WINDOW_UPDATE if the stream is closed
+	// remotely.
+	// if cs.state != stateHalfClosedRemote && cs.state != stateClosed {
+	// }
+	cc.sendWindowUpdate(cs, n)
+}
+
+// cs may be nil for conn-level. Requires mu to be held
+func (cc *clientConn) sendWindowUpdate(cs *clientStream, n int) {
+	// "The legal range for the increment to the flow control
+	// window is 1 to 2^31-1 (2,147,483,647) octets."
+	// A Go Read call on 64-bit machines could in theory read
+	// a larger Read than this. Very unlikely, but we handle it here
+	// rather than elsewhere for now.
+	const maxUint31 = 1<<31 - 1
+	for n >= maxUint31 {
+		cc.sendWindowUpdate32(cs, maxUint31)
+		n -= maxUint31
+	}
+	cc.sendWindowUpdate32(cs, int32(n))
+}
+
+// cs may be nil for conn-level. Requires mu to be held
+func (cc *clientConn) sendWindowUpdate32(cs *clientStream, n int32) {
+	if n == 0 {
+		return
+	}
+	if n < 0 {
+		panic("negative update")
+	}
+	var streamID uint32
+	if cs != nil {
+		streamID = cs.ID
+	}
+	if err := cc.fr.WriteWindowUpdate(streamID, uint32(n)); err != nil {
+		// TODO(bgentry): do something useful with this error. Maybe schedule
+		// writes somehow?
+		panic(err)
+	}
+	cc.bw.Flush()
+	var ok bool
+	if cs == nil {
+		ok = cc.inflow.add(n)
+	} else {
+		ok = cs.inflow.add(n)
+	}
+	if !ok {
+		panic("internal error; sent too many window updates without decrements?")
+	}
+}
+
+type dataFrameWriter struct {
+	cc *clientConn
+	cs *clientStream
+	tr http.Header
+}
+
+// Write sends a data frame with the contents of b.
+func (df dataFrameWriter) Write(b []byte) (int, error) {
+	df.cc.mu.Lock()
+	defer df.cc.mu.Unlock()
+	return len(b), df.cc.fr.WriteData(df.cs.ID, false, b)
+}
+
+// Close closes the stream with either a headers frame if Trailers were set, or
+// an empty data frame. In either case, the frame is sent with the EndStream
+// flag set.
+func (df dataFrameWriter) Close() error {
+	df.cc.mu.Lock()
+	defer df.cc.mu.Unlock()
+	defer df.cc.bw.Flush()
+
+	if df.tr != nil {
+		df.cc.writeTrailers(df.cs.ID, df.tr)
+		return nil
+	}
+	return df.cc.fr.WriteData(df.cs.ID, true, []byte{})
 }
