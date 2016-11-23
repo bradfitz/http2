@@ -186,13 +186,15 @@ func ConfigureServer(s *http.Server, conf *Server) {
 		if testHookOnConn != nil {
 			testHookOnConn()
 		}
-		conf.handleConn(hs, c, h)
+		conf.handleConn(hs, c, h, nil)
 	}
 	s.TLSNextProto[NextProtoTLS] = protoHandler
 	s.TLSNextProto["h2-14"] = protoHandler // temporary; see above.
 }
 
-func (srv *Server) handleConn(hs *http.Server, c net.Conn, h http.Handler) {
+func (srv *Server) newConn(hs *http.Server, c net.Conn, h http.Handler, settings []Setting, upgrade func()) (*serverConn, error) {
+	var err error
+
 	sc := &serverConn{
 		srv:              srv,
 		hs:               hs,
@@ -218,6 +220,25 @@ func (srv *Server) handleConn(hs *http.Server, c net.Conn, h http.Handler) {
 	}
 	sc.flow.add(initialWindowSize)
 	sc.inflow.add(initialWindowSize)
+
+	for _, s := range settings {
+		if err = sc.processSetting(s); err != nil {
+			break
+		}
+	}
+
+	if err == nil && upgrade != nil {
+		sc.upgradeCh = make(chan func(), 1)
+		sc.upgradeCh <- upgrade
+	}
+
+	return sc, err
+}
+
+func (srv *Server) handleConn(hs *http.Server, c net.Conn, h http.Handler, sc *serverConn) {
+	if sc == nil {
+		sc, _ = srv.newConn(hs, c, h, nil, nil)
+	}
 	sc.hpackEncoder = hpack.NewEncoder(&sc.headerWriteBuf)
 	sc.hpackDecoder = hpack.NewDecoder(initialHeaderTableSize, sc.onNewHeaderField)
 
@@ -364,6 +385,8 @@ type serverConn struct {
 	goAwayCode            ErrCode
 	shutdownTimerCh       <-chan time.Time // nil until used
 	shutdownTimer         *time.Timer      // nil until used
+
+	upgradeCh chan func() // nil unless upgrading, only called once
 
 	// Owned by the writeFrameAsync goroutine:
 	headerWriteBuf bytes.Buffer
@@ -609,7 +632,6 @@ func (sc *serverConn) serve() {
 		write: writeSettings{
 			{SettingMaxFrameSize, sc.srv.maxReadFrameSize()},
 			{SettingMaxConcurrentStreams, sc.advMaxStreams},
-
 			// TODO: more actual settings, notably
 			// SettingInitialWindowSize, but then we also
 			// want to bump up the conn window size the
@@ -627,6 +649,10 @@ func (sc *serverConn) serve() {
 
 	settingsTimer := time.NewTimer(firstSettingsTimeout)
 	for {
+		var upgradeCh chan func()
+		if sc.upgradeCh != nil && sc.unackedSettings == 0 {
+			upgradeCh = sc.upgradeCh
+		}
 		select {
 		case wm := <-sc.wantWriteFrameCh:
 			sc.writeFrame(wm)
@@ -657,6 +683,12 @@ func (sc *serverConn) serve() {
 			return
 		case fn := <-sc.testHookCh:
 			fn()
+		case fn, ok := <-upgradeCh:
+			if !ok {
+				sc.upgradeCh = nil
+			} else {
+				fn()
+			}
 		}
 	}
 }
