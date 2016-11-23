@@ -1025,6 +1025,72 @@ func TestServer_RSTStream_Unblocks_Read(t *testing.T) {
 	)
 }
 
+func TestServer_RSTStream_Unblocks_Header_Write(t *testing.T) {
+	inHandler := make(chan bool, 1)
+	unblockHandler := make(chan bool, 1)
+	headerWritten := make(chan bool, 1)
+
+	var st *serverTester
+	st = newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		inHandler <- true
+		str := st.stream(1)
+		if str == nil {
+			t.Error("stream is nil")
+		}
+
+		ch := make(chan bool)
+		st.sc.testHookCh <- func() {
+			if err := st.fr.WriteRSTStream(1, ErrCodeCancel); err != nil {
+				t.Error(err)
+			}
+
+			// Need to make sure the above RST is processed
+			// before writeHeaders() so we manually process
+			// it to avoid racing instead of relying on
+			// the serve() loop
+			select {
+			case fg, ok := <-st.sc.readFrameCh:
+				st.sc.processFrameFromReader(fg, ok)
+			case <-time.After(2 * time.Second):
+				t.Error("failed to process RST")
+			}
+			ch <- true
+		}
+		<-ch
+
+		// need h populated to trigger blocking in writeHeaders
+		h := http.Header{
+			"Foo-Bar": []string{"some-value"},
+		}
+		go func() {
+			st.sc.writeHeaders(str, &writeResHeaders{
+				streamID:    1,
+				httpResCode: 200,
+				h:           h,
+			}, make(chan error, 1))
+			headerWritten <- true
+		}()
+		<-unblockHandler
+	})
+
+	defer st.Close()
+	st.greet()
+	st.writeHeaders(HeadersFrameParam{
+		StreamID:      1,
+		BlockFragment: st.encodeHeader(":method", "POST"),
+		EndStream:     false, // keep it open
+		EndHeaders:    true,
+	})
+	<-inHandler
+
+	select {
+	case <-headerWritten:
+	case <-time.After(2 * time.Second):
+		t.Error("timeout waiting for header write")
+	}
+	unblockHandler <- true
+}
+
 func TestServer_DeadConn_Unblocks_Read(t *testing.T) {
 	testServerPostUnblock(t,
 		func(w http.ResponseWriter, r *http.Request) (err error) {

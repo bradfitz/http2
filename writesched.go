@@ -239,6 +239,9 @@ func (ws *writeScheduler) forgetStream(id uint32) {
 
 	// But keep it for others later.
 	for i := range q.s {
+		if ch := q.s[i].done; ch != nil {
+			close(ch)
+		}
 		q.s[i] = frameWriteMsg{}
 	}
 	q.s = q.s[:0]
