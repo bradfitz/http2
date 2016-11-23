@@ -428,6 +428,11 @@ func (cc *clientConn) readLoop() {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
 		}
+		cc.mu.Lock()
+		for _, cs := range cc.streams {
+			cs.resc <- resAndError{err: err}
+		}
+		cc.mu.Unlock()
 		for _, cs := range activeRes {
 			cs.pw.CloseWithError(err)
 		}
