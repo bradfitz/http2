@@ -6,6 +6,7 @@
 package http2
 
 import (
+	"crypto/tls"
 	"flag"
 	"io"
 	"io/ioutil"
@@ -13,6 +14,8 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -29,7 +32,9 @@ func TestTransportExternal(t *testing.T) {
 	}
 	req, _ := http.NewRequest("GET", "https://"+*transportHost+"/", nil)
 	rt := &Transport{
-		InsecureTLSDial: *insecure,
+		TLSClientConfig: &tls.Config{
+      InsecureSkipVerify: *insecure,
+    },
 	}
 	res, err := rt.RoundTrip(req)
 	if err != nil {
@@ -38,14 +43,93 @@ func TestTransportExternal(t *testing.T) {
 	res.Write(os.Stdout)
 }
 
-func TestTransport(t *testing.T) {
+func TestTransportWorksWithGET(t *testing.T) {
+	if !*extNet {
+		t.Skip("skipping external network test")
+	}
+  tr := &Transport{}
+  c := &http.Client{Transport: tr}
+  res, err := c.Get("https://http2.golang.org/")
+  if err != nil {
+    t.Fatalf("%v", err)
+  }
+
+  if g, w := res.StatusCode, 200; g != w {
+    t.Errorf("StatusCode = %v; want %v", g, w)
+  }
+  b, err := ioutil.ReadAll(res.Body)
+  if int64(len(b)) != res.ContentLength {
+    t.Errorf("Content-Length = %v; want %v", len(b), res.ContentLength) 
+  }
+}
+
+func TestTransportWorksWithPUT(t *testing.T) {
+	if !*extNet {
+		t.Skip("skipping external network test")
+	}
+  tr := &Transport{}
+  c := &http.Client{Transport: tr}
+  req, err := http.NewRequest("PUT", "https://http2.golang.org/crc32", strings.NewReader("Hello, world!"))
+  if err != nil {
+    t.Fatalf("%v", err)
+  }
+  res, err := c.Do(req)
+  if err != nil {
+    t.Fatalf("%v", err)
+  }
+
+  if g, w := res.StatusCode, 200; g != w {
+    t.Errorf("StatusCode = %v; want %v", g, w)
+  }
+  b, err := ioutil.ReadAll(res.Body)
+  if int64(len(b)) != res.ContentLength {
+    t.Errorf("Content-Length = %v; want %v", len(b), res.ContentLength) 
+  }
+}
+
+func TestTransportWorksConcurrently(t *testing.T) {
+	if !*extNet {
+		t.Skip("skipping external network test")
+	}
+  tr := &Transport{DisableCompression: false}
+  c := &http.Client{Transport: tr}
+  wg := sync.WaitGroup{}
+  numReq := 300
+  var counter int32
+  counter = 0
+  wg.Add(numReq)
+  for i := 0; i < numReq; i++ {
+    go func(i int) {
+      defer wg.Done()
+      res, err := c.Get("https://http2.golang.org/")
+      if err != nil {
+        t.Fatalf("%v", err)
+      }
+      if g, w := res.StatusCode, 200; g != w {
+        t.Errorf("StatusCode = %v; want %v", g, w)
+      }
+      b, err := ioutil.ReadAll(res.Body)
+      if int64(len(b)) != res.ContentLength {
+        t.Errorf("Content-Length = %v; want %v", len(b), res.ContentLength) 
+      }
+      atomic.AddInt32(&counter, 1)
+    }(i)
+  }
+  wg.Wait()
+}
+
+func TestTransportSimple(t *testing.T) {
 	const body = "sup"
 	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, body)
 	})
 	defer st.Close()
 
-	tr := &Transport{InsecureTLSDial: true}
+	tr := &Transport{
+		TLSClientConfig: &tls.Config{
+      InsecureSkipVerify: true,
+    },
+	}
 	defer tr.CloseIdleConnections()
 
 	req, err := http.NewRequest("GET", st.ts.URL, nil)
@@ -84,7 +168,6 @@ func TestTransport(t *testing.T) {
 	} else if string(slurp) != body {
 		t.Errorf("Body = %q; want %q", slurp, body)
 	}
-
 }
 
 func TestTransportReusesConns(t *testing.T) {
@@ -92,7 +175,11 @@ func TestTransportReusesConns(t *testing.T) {
 		io.WriteString(w, r.RemoteAddr)
 	}, optOnlyServer)
 	defer st.Close()
-	tr := &Transport{InsecureTLSDial: true}
+	tr := &Transport{
+		TLSClientConfig: &tls.Config{
+      InsecureSkipVerify: true,
+    },
+	}
 	defer tr.CloseIdleConnections()
 	get := func() string {
 		req, err := http.NewRequest("GET", st.ts.URL, nil)
@@ -138,7 +225,9 @@ func TestTransportAbortClosesPipes(t *testing.T) {
 	go func() {
 		defer close(done)
 		tr := &Transport{
-			InsecureTLSDial: true,
+			TLSClientConfig: &tls.Config{
+	      InsecureSkipVerify: true,
+	    },
 		}
 		req, err := http.NewRequest("GET", st.ts.URL, nil)
 		if err != nil {

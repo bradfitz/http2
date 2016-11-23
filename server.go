@@ -407,6 +407,7 @@ type stream struct {
 	state         streamState
 	sentReset     bool // only true once detached from streams map
 	gotReset      bool // only true once detacted from streams map
+	isPush bool
 }
 
 func (sc *serverConn) Framer() *Framer  { return sc.framer }
