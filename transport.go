@@ -25,6 +25,15 @@ import (
 type Transport struct {
 	Fallback http.RoundTripper
 
+	// DialTLS specifies an optional dial function for creating
+	// TLS connections for non-proxied HTTPS requests.
+	//
+	// If DialTLS is nil, net.Dial and the default tls.Config are used.
+	//
+	// The returned net.Conn is assumed to already be
+	// past the TLS handshake.
+	DialTLS func(network, addr string) (net.Conn, error)
+
 	// TODO: remove this and make more general with a TLS dial hook, like http
 	InsecureTLSDial bool
 
@@ -34,7 +43,7 @@ type Transport struct {
 
 type clientConn struct {
 	t        *Transport
-	tconn    *tls.Conn
+	conn     net.Conn
 	tlsState *tls.ConnectionState
 	connKey  []string // key(s) this connection is cached in, in t.conns
 
@@ -186,19 +195,34 @@ func (t *Transport) newClientConn(host, port, key string) (*clientConn, error) {
 		NextProtos:         []string{NextProtoTLS},
 		InsecureSkipVerify: t.InsecureTLSDial,
 	}
-	tconn, err := tls.Dial("tcp", host+":"+port, cfg)
-	if err != nil {
-		return nil, err
-	}
-	if err := tconn.Handshake(); err != nil {
-		return nil, err
-	}
-	if !t.InsecureTLSDial {
-		if err := tconn.VerifyHostname(cfg.ServerName); err != nil {
+	addr := host + ":" + port
+	var conn net.Conn
+	if t.DialTLS != nil {
+		var err error
+		conn, err = t.DialTLS("tcp", addr)
+		if err != nil {
 			return nil, err
 		}
+	} else {
+		tconn, err := tls.Dial("tcp", addr, cfg)
+		if err != nil {
+			return nil, err
+		}
+		if err := tconn.Handshake(); err != nil {
+			return nil, err
+		}
+		if !t.InsecureTLSDial {
+			if err := tconn.VerifyHostname(cfg.ServerName); err != nil {
+				return nil, err
+			}
+		}
+		conn = tconn
 	}
-	state := tconn.ConnectionState()
+
+	type connectionStater interface {
+		ConnectionState() tls.ConnectionState
+	}
+	state := conn.(connectionStater).ConnectionState()
 	if p := state.NegotiatedProtocol; p != NextProtoTLS {
 		// TODO(bradfitz): fall back to Fallback
 		return nil, fmt.Errorf("bad protocol: %v", p)
@@ -206,13 +230,13 @@ func (t *Transport) newClientConn(host, port, key string) (*clientConn, error) {
 	if !state.NegotiatedProtocolIsMutual {
 		return nil, errors.New("could not negotiate protocol mutually")
 	}
-	if _, err := tconn.Write(clientPreface); err != nil {
+	if _, err := conn.Write(clientPreface); err != nil {
 		return nil, err
 	}
 
 	cc := &clientConn{
 		t:                    t,
-		tconn:                tconn,
+		conn:                 conn,
 		connKey:              []string{key}, // TODO: cert's validated hostnames too
 		tlsState:             &state,
 		readerDone:           make(chan struct{}),
@@ -222,8 +246,8 @@ func (t *Transport) newClientConn(host, port, key string) (*clientConn, error) {
 		maxConcurrentStreams: 1000,     // "infinite", per spec. 1000 seems good enough.
 		streams:              make(map[uint32]*clientStream),
 	}
-	cc.bw = bufio.NewWriter(stickyErrWriter{tconn, &cc.werr})
-	cc.br = bufio.NewReader(tconn)
+	cc.bw = bufio.NewWriter(stickyErrWriter{conn, &cc.werr})
+	cc.br = bufio.NewReader(conn)
 	cc.fr = NewFramer(cc.bw, cc.br)
 	cc.henc = hpack.NewEncoder(&cc.hbuf)
 
@@ -292,7 +316,7 @@ func (cc *clientConn) closeIfIdle() {
 	// TODO: do clients send GOAWAY too? maybe? Just Close:
 	cc.mu.Unlock()
 
-	cc.tconn.Close()
+	cc.conn.Close()
 }
 
 func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
