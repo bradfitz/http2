@@ -858,6 +858,40 @@ func testRejectRequest(t *testing.T, send func(*serverTester)) {
 	st.wantRSTStream(1, ErrCodeProtocol)
 }
 
+func TestServer_Rejects_CompressionInvalid(t *testing.T) {
+	testRejectCompression(t, func(st *serverTester) {
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      1,
+			BlockFragment: []byte{255, 186, 9},
+			EndStream:     false,
+			EndHeaders:    false,
+		})
+	})
+}
+
+func TestServer_Rejects_CompressionIncomplete(t *testing.T) {
+	testRejectCompression(t, func(st *serverTester) {
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      1,
+			BlockFragment: []byte{255},
+			EndStream:     true,
+			EndHeaders:    true,
+		})
+	})
+}
+
+func testRejectCompression(t *testing.T, send func(*serverTester)) {
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {})
+	st.addLogFilter("connection error: COMPRESSION_ERROR")
+	defer st.Close()
+
+	st.greet()
+	send(st)
+	if got, want := st.wantGoAway().ErrCode, ErrCodeCompression; got != want {
+		t.Errorf("GOAWAY err = %v; want %v", got, want)
+	}
+}
+
 func TestServer_Ping(t *testing.T) {
 	st := newServerTester(t, nil)
 	defer st.Close()

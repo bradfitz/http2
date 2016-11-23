@@ -1254,17 +1254,21 @@ func (sc *serverConn) processContinuation(f *ContinuationFrame) error {
 
 func (sc *serverConn) processHeaderBlockFragment(st *stream, frag []byte, end bool) error {
 	sc.serveG.check()
+	// https://http2.github.io/http2-spec/#rfc.section.4.3
+	// "Header compression is stateful. One compression context and
+	// one decompression context is used for the entire connection.
+	// A decoding error in a header block MUST be treated as a
+	// connection error (Section 5.4.1) of type COMPRESSION_ERROR."
 	if _, err := sc.hpackDecoder.Write(frag); err != nil {
-		// TODO: convert to stream error I assume?
-		return err
+		return ConnectionError(ErrCodeCompression)
 	}
 	if !end {
 		return nil
 	}
 	if err := sc.hpackDecoder.Close(); err != nil {
-		// TODO: convert to stream error I assume?
-		return err
+		return ConnectionError(ErrCodeCompression)
 	}
+
 	defer sc.resetPendingRequest()
 	if sc.curOpenStreams > sc.advMaxStreams {
 		// "Endpoints MUST NOT exceed the limit set by their
