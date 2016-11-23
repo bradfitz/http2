@@ -81,6 +81,7 @@ func newServerTester(t testing.TB, handler http.HandlerFunc, opts ...interface{}
 		NextProtos: []string{NextProtoTLS, "h2-14"},
 	}
 
+	var hooks []func(*serverConn)
 	onlyServer := false
 	for _, opt := range opts {
 		switch v := opt.(type) {
@@ -88,6 +89,8 @@ func newServerTester(t testing.TB, handler http.HandlerFunc, opts ...interface{}
 			v(tlsConfig)
 		case func(*httptest.Server):
 			v(ts)
+		case func(*serverConn):
+			hooks = append(hooks, v)
 		case serverTesterOpt:
 			onlyServer = (v == optOnlyServer)
 		default:
@@ -123,6 +126,9 @@ func newServerTester(t testing.TB, handler http.HandlerFunc, opts ...interface{}
 		defer st.scMu.Unlock()
 		st.sc = v
 		st.sc.testHookCh = make(chan func())
+		for _, h := range hooks {
+			h(v)
+		}
 	}
 	log.SetOutput(io.MultiWriter(stderrv, twriter{t: t, st: st}))
 	if !onlyServer {
@@ -207,6 +213,12 @@ func (st *serverTester) writeSettingsAck() {
 func (st *serverTester) writeHeaders(p HeadersFrameParam) {
 	if err := st.fr.WriteHeaders(p); err != nil {
 		st.t.Fatalf("Error writing HEADERS: %v", err)
+	}
+}
+
+func (st *serverTester) writeContinuation(id uint32, end bool, frag []byte) {
+	if err := st.fr.WriteContinuation(id, end, frag); err != nil {
+		st.t.Fatalf("Error writing CONTINUATION: %v", err)
 	}
 }
 
@@ -752,10 +764,7 @@ func TestServer_Request_WithContinuation(t *testing.T) {
 					EndHeaders:    false, // we'll have continuation frames
 				})
 			} else {
-				err := st.fr.WriteContinuation(1, len(remain) == 0, chunk)
-				if err != nil {
-					t.Fatal(err)
-				}
+				st.writeContinuation(1, len(remain) == 0, chunk)
 			}
 			chunks++
 		}
@@ -1165,9 +1174,7 @@ func TestServer_Rejects_HeadersEnd_Then_Continuation(t *testing.T) {
 			EndHeaders:    true,
 		})
 		st.wantHeaders()
-		if err := st.fr.WriteContinuation(1, true, encodeHeaderNoImplicit(t, "foo", "bar")); err != nil {
-			t.Fatal(err)
-		}
+		st.writeContinuation(1, true, encodeHeaderNoImplicit(t, "foo", "bar"))
 	})
 }
 
@@ -1180,9 +1187,7 @@ func TestServer_Rejects_HeadersNoEnd_Then_ContinuationWrongStream(t *testing.T) 
 			EndStream:     true,
 			EndHeaders:    false,
 		})
-		if err := st.fr.WriteContinuation(3, true, encodeHeaderNoImplicit(t, "foo", "bar")); err != nil {
-			t.Fatal(err)
-		}
+		st.writeContinuation(3, true, encodeHeaderNoImplicit(t, "foo", "bar"))
 	})
 }
 
@@ -1203,9 +1208,7 @@ func TestServer_Rejects_Headers0(t *testing.T) {
 func TestServer_Rejects_Continuation0(t *testing.T) {
 	testServerRejects(t, func(st *serverTester) {
 		st.fr.AllowIllegalWrites = true
-		if err := st.fr.WriteContinuation(0, true, st.encodeHeader()); err != nil {
-			t.Fatal(err)
-		}
+		st.writeContinuation(0, true, st.encodeHeader())
 	})
 }
 
@@ -1871,9 +1874,7 @@ func TestServer_Rejects_Too_Many_Streams(t *testing.T) {
 		EndStream:     true,
 		EndHeaders:    false, // CONTINUATION coming
 	})
-	if err := st.fr.WriteContinuation(rejectID, true, frag2); err != nil {
-		t.Fatal(err)
-	}
+	st.writeContinuation(rejectID, true, frag2)
 	st.wantRSTStream(rejectID, ErrCodeProtocol)
 
 	// But let a handler finish:
@@ -2048,6 +2049,38 @@ func TestServer_Advertises_Common_Cipher(t *testing.T) {
 	})
 	defer st.Close()
 	st.greet()
+}
+
+func TestServer_ReadFrames_Exits(t *testing.T) {
+	// Prevent the Framer from being closed with the connection so
+	// we can simulate a race where the next frame is read before
+	// the connection is closed by the serve loop.
+	r, w := io.Pipe()
+	st := newServerTester(t, nil, func(sc *serverConn) {
+		sc.framer.r = r
+	})
+	st.fr.w = w
+	defer st.Close()
+
+	st.greet()
+
+	// Cause a ConnectionError and the death of the serve loop.
+	st.writeContinuation(99, true, nil)
+	select {
+	case <-st.sc.doneServing:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for serve loop to exit")
+	}
+
+	for i := 0; i < 100; i++ {
+		getSlash(st)
+		fg, ok := <-st.sc.readFrameCh
+		if !ok {
+			return
+		}
+		fg.g.Done()
+	}
+	t.Fatal("readFrames loop failed to exit")
 }
 
 // TODO: move this onto *serverTester, and re-use the same hpack
