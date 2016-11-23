@@ -384,6 +384,33 @@ type requestParam struct {
 	invalidHeader     bool // an invalid header was seen
 }
 
+func (rp *requestParam) isValid() bool {
+	// 8.1.2.3 Request Pseudo-Header Fields
+	// All HTTP/2 requests MUST include exactly one valid
+	// value for the :method, :scheme, and :path pseudo-header fields,
+	// unless it is a CONNECT request (Section 8.3).
+	if rp.invalidHeader {
+		return false
+	}
+	if rp.method == "CONNECT" {
+		return rp.scheme == "" && rp.path == "" && isHostPort(rp.authority)
+	}
+	return rp.method != "" && rp.path != "" && (rp.scheme == "https" || rp.scheme == "http")
+}
+
+func isHostPort(str string) bool {
+	_, _, err := net.SplitHostPort(str)
+	return err == nil
+}
+
+func (rp *requestParam) parseURL() (*url.URL, error) {
+	if rp.method == "CONNECT" {
+		return &url.URL{Host: rp.authority}, nil
+	}
+	// TODO: handle asterisk '*' requests + test
+	return url.ParseRequestURI(rp.path)
+}
+
 // stream represents a stream. This is the minimal metadata needed by
 // the serve goroutine. Most of the actual stream state is owned by
 // the http.Handler's goroutine in the responseWriter. Because the
@@ -1347,18 +1374,12 @@ func (sc *serverConn) resetPendingRequest() {
 func (sc *serverConn) newWriterAndRequest() (*responseWriter, *http.Request, error) {
 	sc.serveG.check()
 	rp := &sc.req
-	if rp.invalidHeader || rp.method == "" || rp.path == "" ||
-		(rp.scheme != "https" && rp.scheme != "http") {
+	if !rp.isValid() {
 		// See 8.1.2.6 Malformed Requests and Responses:
 		//
 		// Malformed requests or responses that are detected
 		// MUST be treated as a stream error (Section 5.4.2)
 		// of type PROTOCOL_ERROR."
-		//
-		// 8.1.2.3 Request Pseudo-Header Fields
-		// "All HTTP/2 requests MUST include exactly one valid
-		// value for the :method, :scheme, and :path
-		// pseudo-header fields"
 		return nil, nil, StreamError{rp.stream.id, ErrCodeProtocol}
 	}
 	var tlsState *tls.ConnectionState // nil if not scheme https
@@ -1379,8 +1400,7 @@ func (sc *serverConn) newWriterAndRequest() (*responseWriter, *http.Request, err
 		stream:        rp.stream,
 		needsContinue: needsContinue,
 	}
-	// TODO: handle asterisk '*' requests + test
-	url, err := url.ParseRequestURI(rp.path)
+	url, err := rp.parseURL()
 	if err != nil {
 		// TODO: find the right error code?
 		return nil, nil, StreamError{rp.stream.id, ErrCodeProtocol}

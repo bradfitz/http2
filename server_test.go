@@ -847,6 +847,24 @@ func TestServer_Request_Reject_Pseudo_Unknown(t *testing.T) {
 	})
 }
 
+func TestServer_Request_Reject_Pseudo_Connect_scheme_present(t *testing.T) {
+	testRejectRequest(t, func(st *serverTester) {
+		st.bodylessReq1(":method", "CONNECT", ":scheme", "https")
+	})
+}
+
+func TestServer_Request_Reject_Pseudo_Connect_path_present(t *testing.T) {
+	testRejectRequest(t, func(st *serverTester) {
+		st.bodylessReq1(":method", "CONNECT", ":path", "foo")
+	})
+}
+
+func TestServer_Request_Reject_Pseudo_Connect_authority_invalid(t *testing.T) {
+	testRejectRequest(t, func(st *serverTester) {
+		st.bodylessReq1(":method", "CONNECT", ":authority", "bar")
+	})
+}
+
 func testRejectRequest(t *testing.T, send func(*serverTester)) {
 	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("server request made it to handler; should've been rejected")
@@ -856,6 +874,21 @@ func testRejectRequest(t *testing.T, send func(*serverTester)) {
 	st.greet()
 	send(st)
 	st.wantRSTStream(1, ErrCodeProtocol)
+}
+
+func TestServer_Request_Connect(t *testing.T) {
+	const authority = "example.com:443"
+	testServerRequest(t, func(st *serverTester) {
+		st.bodylessReq1(
+			":method", "CONNECT",
+			":scheme", "",
+			":path", "",
+			":authority", authority)
+	}, func(r *http.Request) {
+		if r.URL.Host != authority {
+			t.Errorf("URL.Host = %q; want %q", r.URL.Host, authority)
+		}
+	})
 }
 
 func TestServer_Ping(t *testing.T) {
