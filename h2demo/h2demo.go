@@ -168,7 +168,7 @@ func fileServer(url string) http.Handler {
 	})
 }
 
-func clockStreamHandler(w http.ResponseWriter, r *http.Request) {
+func streamHandler(w http.ResponseWriter, r *http.Request, fn func(w io.Writer)) {
 	clientGone := w.(http.CloseNotifier).CloseNotify()
 	w.Header().Set("Content-Type", "text/plain")
 	ticker := time.NewTicker(1 * time.Second)
@@ -177,7 +177,7 @@ func clockStreamHandler(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, strings.Repeat("# xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", 13))
 
 	for {
-		fmt.Fprintf(w, "%v\n", time.Now())
+		fn(w)
 		w.(http.Flusher).Flush()
 		select {
 		case <-ticker.C:
@@ -186,6 +186,18 @@ func clockStreamHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+func clockStreamHandler(w http.ResponseWriter, r *http.Request) {
+	streamHandler(w, r, func(w io.Writer) {
+		fmt.Fprintf(w, "%v\n", time.Now())
+	})
+}
+
+func poopStreamHandler(w http.ResponseWriter, r *http.Request) {
+	streamHandler(w, r, func(w io.Writer) {
+		w.Write([]byte("\U0001F4A9"))
+	})
 }
 
 func registerHandlers() {
@@ -217,6 +229,7 @@ func registerHandlers() {
 	mux2.HandleFunc("/reqinfo", reqInfoHandler)
 	mux2.HandleFunc("/crc32", crcHandler)
 	mux2.HandleFunc("/clockstream", clockStreamHandler)
+	mux2.HandleFunc("/poop", poopStreamHandler)
 	mux2.Handle("/gophertiles", tiles)
 	mux2.HandleFunc("/redirect", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
