@@ -143,23 +143,23 @@ func (app *h2i) Main() error {
 	log.Printf("Connecting to %s ...", hostAndPort)
 	tc, err := tls.Dial("tcp", hostAndPort, cfg)
 	if err != nil {
-		return fmt.Errorf("Error dialing %s: %v", withPort(app.host), err)
+		return fmt.Errorf("error dialing %s: %v", withPort(app.host), err)
 	}
 	log.Printf("Connected to %v", tc.RemoteAddr())
 	defer tc.Close()
 
 	if err := tc.Handshake(); err != nil {
-		return fmt.Errorf("TLS handshake: %v", err)
+		return fmt.Errorf("tLS handshake: %v", err)
 	}
 	if !*flagInsecure {
 		if err := tc.VerifyHostname(app.host); err != nil {
-			return fmt.Errorf("VerifyHostname: %v", err)
+			return fmt.Errorf("verifyHostname: %v", err)
 		}
 	}
 	state := tc.ConnectionState()
 	log.Printf("Negotiated protocol %q", state.NegotiatedProtocol)
 	if !state.NegotiatedProtocolIsMutual || state.NegotiatedProtocol == "" {
-		return fmt.Errorf("Could not negotiate protocol mutually")
+		return fmt.Errorf("could not negotiate protocol mutually")
 	}
 
 	if _, err := io.WriteString(tc, http2.ClientPreface); err != nil {
@@ -410,7 +410,7 @@ func (app *h2i) readFrames() error {
 	for {
 		f, err := app.framer.ReadFrame()
 		if err != nil {
-			return fmt.Errorf("ReadFrame: %v", err)
+			return fmt.Errorf("readFrame: %v", err)
 		}
 		app.logf("%v", f)
 		switch f := f.(type) {

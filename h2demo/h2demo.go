@@ -343,7 +343,7 @@ func serveProdTLS() error {
 			Key:    key,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("Error fetching GCS object %q in bucket %q: %v", key, bucket, err)
+			return nil, fmt.Errorf("error fetching GCS object %q in bucket %q: %v", key, bucket, err)
 		}
 		defer rc.Close()
 		return ioutil.ReadAll(rc)

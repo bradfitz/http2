@@ -1517,7 +1517,7 @@ func TestServer_Response_LargeWrite(t *testing.T) {
 	testServerResponse(t, func(w http.ResponseWriter, r *http.Request) error {
 		n, err := w.Write(bytes.Repeat([]byte("a"), size))
 		if err != nil {
-			return fmt.Errorf("Write error: %v", err)
+			return fmt.Errorf("write error: %v", err)
 		}
 		if n != size {
 			return fmt.Errorf("wrong size %d from Write", n)
@@ -1590,7 +1590,7 @@ func TestServer_Response_LargeWrite_FlowControlled(t *testing.T) {
 		w.(http.Flusher).Flush()
 		n, err := w.Write(bytes.Repeat([]byte("a"), size))
 		if err != nil {
-			return fmt.Errorf("Write error: %v", err)
+			return fmt.Errorf("write error: %v", err)
 		}
 		if n != size {
 			return fmt.Errorf("wrong size %d from Write", n)
@@ -1727,7 +1727,7 @@ func TestServer_Response_Automatic100Continue(t *testing.T) {
 		buf := make([]byte, len(msg))
 		// This read should trigger the 100-continue being sent.
 		if n, err := io.ReadFull(r.Body, buf); err != nil || n != len(msg) || string(buf) != msg {
-			return fmt.Errorf("ReadFull = %q, %v; want %q, nil", buf[:n], err, msg)
+			return fmt.Errorf("readFull = %q, %v; want %q, nil", buf[:n], err, msg)
 		}
 		_, err := io.WriteString(w, reply)
 		return err
